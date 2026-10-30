@@ -7,6 +7,8 @@ export default {
       fontFamily: {
         sans: ['Inter', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
       },
+      // Do NOT put a 'colors' object here. 
+      // This empty space allows Tailwind to use emerald, slate, and rose.
     },
   },
   plugins: [],

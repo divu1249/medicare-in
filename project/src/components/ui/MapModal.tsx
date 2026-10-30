@@ -11,7 +11,7 @@ interface MapModalProps {
 
 export default function MapModal({ open, onClose, categoryTitle, locationContext }: MapModalProps) {
   const [zoomLevel, setZoomLevel] = useState(14);
-
+  const mapUrl = `https://maps.google.com/maps?q=${searchQuery}&t=m&z=14&output=embed`;
   const encodedQuery = encodeURIComponent(`${categoryTitle} near ${locationContext}`);
   const embedUrl = `https://maps.google.com/maps?q=${encodedQuery}&t=&z=${zoomLevel}&ie=UTF8&iwloc=&output=embed`;
   const externalMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodedQuery}`;
