@@ -11,7 +11,7 @@ export default function MapModal({ open, onClose, categoryTitle, locationContext
   if (!open) return null;
 
   const searchQuery = encodeURIComponent(`${categoryTitle} near ${locationContext}`);
-  const mapUrl = `https://www.google.com/maps?q=${searchQuery}&output=embed`;
+  const mapUrl = `https://maps.google.com/maps?q=${searchQuery}&t=&z=14&ie=UTF8&iwloc=&output=embed`;  
   const externalUrl = `https://www.google.com/maps/search/?api=1&query=${searchQuery}`;
 
   return (
