@@ -3,9 +3,11 @@ import { Link } from 'react-router-dom';
 import {
   Siren, Phone, Copy, Download, Printer, MapPin, Hospital, AlertTriangle,
   ShieldCheck, Heart, Activity, FileText, CheckCircle2, Info, BookOpen,
+  Search, Crosshair, Navigation,
 } from 'lucide-react';
 import { useData } from '@/context/DataContext';
 import { Card, PageHeader, Badge, SectionTitle } from '@/components/ui';
+import MapModal from '@/components/ui/MapModal';
 import { useToast } from '@/components/ui/Toast';
 import { generateEmergencyPDF } from '@/lib/pdf';
 import { formatDate } from '@/lib/medUtils';
@@ -103,6 +105,17 @@ export default function EmergencyAssistance() {
   const { profile, medications } = useData();
   const notify = useToast();
   const [checked, setChecked] = useState<Record<number, boolean>>({});
+  const [locationContext, setLocationContext] = useState('New Delhi');
+  const [activeMapCategory, setActiveMapCategory] = useState<{ title: string } | null>(null);
+
+  function detectGPS() {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => setLocationContext(`${pos.coords.latitude.toFixed(3)}, ${pos.coords.longitude.toFixed(3)}`),
+      () => console.log('GPS denied'),
+      { timeout: 8000, enableHighAccuracy: true },
+    );
+  }
 
   function copyDetails() {
     const lines = [
@@ -227,9 +240,37 @@ export default function EmergencyAssistance() {
         </Card>
       </div>
 
-      {/* Hospital directory (sample) */}
+      {/* Hospital discovery */}
       <Card className="mt-6">
-        <SectionTitle className="mb-3">Sample Hospital Directory</SectionTitle>
+        <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400">
+              <Navigation className="h-5 w-5" />
+            </div>
+            <div>
+              <SectionTitle>Hospital Discovery</SectionTitle>
+              <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+                Current region: <span className="font-semibold text-emerald-600 dark:text-emerald-400">{locationContext}</span>
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={detectGPS} className="btn bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700">
+              <Crosshair className="h-3.5 w-3.5" /> Detect My GPS
+            </button>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+              <input
+                className="input w-48 pl-8 text-xs"
+                value={locationContext}
+                onChange={(e) => setLocationContext(e.target.value)}
+                placeholder="City / Area / Pin"
+                aria-label="Location search"
+              />
+            </div>
+          </div>
+        </div>
+
         <div className="mb-3 flex items-start gap-2 rounded-xl bg-secondary-50 p-3 text-xs text-secondary-700 dark:bg-secondary-700/10 dark:text-secondary-400">
           <MapPin className="mt-0.5 h-4 w-4 shrink-0" />
           <p>This is a sample demonstration directory. These are not real, verified emergency facilities. Contact your local emergency services for actual hospital information.</p>
@@ -240,18 +281,35 @@ export default function EmergencyAssistance() {
             { name: 'General Medical Centre (Sample)', addr: '55 Residency Rd, Bengaluru 560025', phone: '+91 80 2233 4455' },
             { name: 'Community Health Hub (Sample)', addr: '12 Cunningham Rd, Bengaluru 560052', phone: '+91 80 2299 8877' },
           ].map((h) => (
-            <div key={h.name} className="rounded-xl border border-gray-100 p-4 dark:border-slate-800">
+            <button
+              type="button"
+              key={h.name}
+              onClick={() => setActiveMapCategory({ title: h.name })}
+              className="rounded-xl border border-gray-100 p-4 text-left transition hover:border-emerald-400 dark:border-slate-800"
+            >
               <div className="mb-2 flex items-center gap-2">
                 <Hospital className="h-4 w-4 text-primary-500" />
                 <span className="text-sm font-medium text-gray-900 dark:text-white">{h.name}</span>
               </div>
               <p className="text-xs text-gray-500 dark:text-gray-400">{h.addr}</p>
               <p className="text-xs text-gray-500 dark:text-gray-400">{h.phone}</p>
-              <Badge variant="info">Sample</Badge>
-            </div>
+              <div className="mt-2 flex items-center justify-between">
+                <Badge variant="info">Sample</Badge>
+                <span className="text-xs font-medium text-emerald-600">View In-App Map</span>
+              </div>
+            </button>
           ))}
         </div>
       </Card>
+
+      {activeMapCategory && (
+        <MapModal
+          open={Boolean(activeMapCategory)}
+          onClose={() => setActiveMapCategory(null)}
+          categoryTitle={activeMapCategory.title}
+          locationContext={locationContext}
+        />
+      )}
 
       {/* Preparedness checklist */}
       <Card className="mt-6">
