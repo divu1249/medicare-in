@@ -9,6 +9,13 @@ interface MapModalProps {
   locationContext: string;
 }
 
+// The query string for the embedded iframe (shows pins)
+const searchQuery = encodeURIComponent(`${categoryTitle} near ${locationContext}`);
+const mapUrl = `https://maps.google.com/maps?q=${searchQuery}&t=m&z=14&output=embed`;
+  
+// NEW: Direct turn-by-turn navigation link using the user's live location
+const directionsUrl = `https://www.google.com/maps/dir/?api=1&destination=${searchQuery}`;
+
 export default function MapModal({ open, onClose, categoryTitle, locationContext }: MapModalProps) {
   const [zoomLevel, setZoomLevel] = useState(14);
   const mapUrl = `https://maps.google.com/maps?q=${searchQuery}&t=m&z=14&output=embed`;
@@ -62,7 +69,16 @@ export default function MapModal({ open, onClose, categoryTitle, locationContext
             </button>
           </div>
         </div>
-
+	<div className="flex items-center gap-2">
+            {/* New Directions Button */}
+            <a href={directionsUrl} target="_blank" rel="noopener noreferrer" className="btn bg-emerald-600 hover:bg-emerald-700 text-white py-2 px-3 text-xs flex-1 sm:flex-none flex items-center justify-center gap-1.5 shadow-sm">
+              <Navigation className="h-3.5 w-3.5" /> Get Directions
+            </a>
+            
+            <a href={`https://www.google.com/maps/search/?api=1&query=${searchQuery}`} target="_blank" rel="noopener noreferrer" className="btn btn-outline py-2 px-3 text-xs hidden sm:flex items-center justify-center gap-1.5">
+              <ExternalLink className="h-3.5 w-3.5" /> Open Maps
+            </a>
+          </div>
         <div className="relative h-[420px] w-full overflow-hidden rounded-xl border border-gray-200 bg-gray-100 dark:border-slate-700 dark:bg-slate-900">
           <iframe
             title={`Map of ${categoryTitle}`}
