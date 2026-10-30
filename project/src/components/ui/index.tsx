@@ -4,7 +4,7 @@ export function PageHeader({ title, subtitle, actions }: { title: string; subtit
   return (
     <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">{title}</h1>
+        <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">{title}</h1>
         {subtitle && <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">{subtitle}</p>}
       </div>
       {actions && <div className="flex flex-wrap gap-2">{actions}</div>}
@@ -13,11 +13,11 @@ export function PageHeader({ title, subtitle, actions }: { title: string; subtit
 }
 
 export function Card({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <div className={`card p-5 ${className}`}>{children}</div>;
+  return <div className={`card border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900 ${className}`}>{children}</div>;
 }
 
 export function SectionTitle({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <h2 className={`text-lg font-semibold text-gray-900 dark:text-white ${className}`}>{children}</h2>;
+  return <h2 className={`text-lg font-semibold text-slate-900 dark:text-slate-100 ${className}`}>{children}</h2>;
 }
 
 export function EmptyState({ icon, title, message, action }: { icon?: ReactNode; title: string; message?: string; action?: ReactNode }) {
@@ -34,11 +34,11 @@ export function EmptyState({ icon, title, message, action }: { icon?: ReactNode;
 export function Badge({ variant = 'neutral', children }: { variant?: 'neutral' | 'success' | 'warning' | 'error' | 'info' | 'primary'; children: ReactNode }) {
   const variants = {
     neutral: 'bg-gray-100 text-gray-700 dark:bg-slate-700 dark:text-gray-200',
-    success: 'bg-success-100 text-success-700 dark:bg-success-700/30 dark:text-success-400',
+    success: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-700/30 dark:text-emerald-400',
     warning: 'bg-warning-100 text-warning-700 dark:bg-warning-700/30 dark:text-warning-400',
     error: 'bg-error-100 text-error-700 dark:bg-error-700/30 dark:text-error-400',
     info: 'bg-secondary-100 text-secondary-700 dark:bg-secondary-700/30 dark:text-secondary-400',
-    primary: 'bg-primary-100 text-primary-700 dark:bg-primary-700/30 dark:text-primary-400',
+    primary: 'bg-emerald-600 text-white dark:bg-emerald-600 dark:text-white',
   };
   return <span className={`badge ${variants[variant]}`}>{children}</span>;
 }
@@ -52,12 +52,12 @@ export function StatCard({ label, value, icon, accent = 'primary' }: { label: st
     error: 'bg-error-50 text-error-600 dark:bg-error-700/20 dark:text-error-400',
   };
   return (
-    <div className="card p-4">
+    <div className="card border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
       <div className="flex items-center gap-3">
         <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${accents[accent]}`}>{icon}</div>
         <div>
           <p className="text-xs font-medium text-gray-500 dark:text-gray-400">{label}</p>
-          <p className="text-xl font-bold text-gray-900 dark:text-white">{value}</p>
+          <p className="text-xl font-bold text-slate-900 dark:text-slate-100">{value}</p>
         </div>
       </div>
     </div>
@@ -71,8 +71,8 @@ export function ConfirmDialog({ open, onClose, onConfirm, title, message, confir
   return (
     <div className="fixed inset-0 z-[95] flex items-center justify-center p-4 no-print">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900">
-        <h3 className="text-lg font-semibold text-gray-900 dark:text-white">{title}</h3>
+      <div className="relative w-full max-w-sm rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+        <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">{title}</h3>
         <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">{message}</p>
         <div className="mt-5 flex justify-end gap-2">
           <button onClick={onClose} className="btn btn-outline">Cancel</button>
