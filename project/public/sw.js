@@ -51,3 +51,45 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close(); // closing/dismissing never marks a dose as taken
   event.waitUntil(self.clients.openWindow('/reminders'));
 });
+
+// Add this below your existing push notification code in sw.js
+
+const CACHE_NAME = 'mediguard-offline-v1';
+
+self.addEventListener('install', (event) => {
+  self.skipWaiting();
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => {
+      return cache.addAll([
+        '/',
+        '/index.html',
+        '/manifest.json' // Ensure you have a basic manifest in public/
+      ]);
+    })
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', (event) => {
+  // Only cache GET requests
+  if (event.request.method !== 'GET') return;
+
+  event.respondWith(
+    fetch(event.request)
+      .then((response) => {
+        // Clone and cache the live response for future offline use
+        const responseClone = response.clone();
+        caches.open(CACHE_NAME).then((cache) => {
+          cache.put(event.request, responseClone);
+        });
+        return response;
+      })
+      .catch(() => {
+        // If network fails (offline), return the cached version
+        return caches.match(event.request);
+      })
+  );
+});
