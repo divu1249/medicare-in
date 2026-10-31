@@ -4,26 +4,31 @@ import {
   LayoutDashboard, Pill, Bell, Camera, Package, RefreshCw, Siren,
   Shield, BookOpen, Bot, FolderHeart, FileText, User, Settings,
   Menu, X, Activity, HeartPulse, Wifi, WifiOff,
+  Layers, Flame, PawPrint, Building // New icons added here
 } from 'lucide-react';
 import ThemeToggle from './ThemeToggle';
 import { useData } from '@/context/DataContext';
 import { checkOnlineStatus } from '@/lib/offline';
 
 export const navItems = [
+  { path: '/vision', label: 'Platform Vision', icon: Layers },
   { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { path: '/medications', label: 'My Medications', icon: Pill },
   { path: '/reminders', label: 'Dose Reminders', icon: Bell },
   { path: '/camera-monitoring', label: 'Camera Monitoring', icon: Camera },
   { path: '/inventory', label: 'Medicine Inventory', icon: Package },
   { path: '/refill-alerts', label: 'Refill Alerts', icon: RefreshCw },
+  { path: '/pet-care', label: 'Veterinary Hub', icon: PawPrint },
   { path: '/emergency', label: 'Emergency Assistance', icon: Siren },
   { path: '/emergency-guide', label: 'Emergency Guide', icon: Shield },
   { path: '/library', label: 'Medical Library', icon: BookOpen },
   { path: '/ai-advisor', label: 'AI Health Advisor', icon: Bot },
+  { path: '/myth-busters', label: 'Myth Busters', icon: Flame },
   { path: '/patient-file', label: 'My Patient File', icon: FolderHeart },
   { path: '/reports', label: 'Medical Reports', icon: FileText },
   { path: '/profile', label: 'My Profile', icon: User },
   { path: '/settings', label: 'Settings', icon: Settings },
+  { path: '/admin', label: 'Enterprise Admin', icon: Building },
 ];
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
@@ -65,8 +70,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                 <HeartPulse className="h-5 w-5" />
               </div>
               <div>
-                <span className="text-lg font-bold text-gray-900 dark:text-white">MediCare</span>
-                <span className="ml-1 text-lg font-bold text-primary-600 dark:text-primary-400">AI</span>
+                <span className="text-lg font-bold text-gray-900 dark:text-white">MediGuard</span>
+                <span className="ml-1 text-lg font-bold text-primary-600 dark:text-primary-400">IN</span>
               </div>
             </Link>
           </div>
