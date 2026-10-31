@@ -6,6 +6,7 @@ import { ToastProvider } from '@/components/ui/Toast';
 import { initTheme } from '@/lib/theme';
 import { registerServiceWorker } from '@/lib/offline';
 
+// Page Imports
 import LandingPage from '@/pages/LandingPage';
 import Dashboard from '@/pages/Dashboard';
 import Medications from '@/pages/Medications';
@@ -21,9 +22,12 @@ import PatientFile from '@/pages/PatientFile';
 import MedicalReports from '@/pages/MedicalReports';
 import MyProfile from '@/pages/MyProfile';
 import Settings from '@/pages/Settings';
+
+// Hackathon USP Page Imports
+import PlatformVision from '@/pages/PlatformVision';
 import MythBusters from '@/pages/MythBusters';
 import PetCare from '@/pages/PetCare';
-import PlatformVision from '@/pages/PlatformVision';
+import GovSchemes from '@/pages/GovSchemes';
 import AdminDashboard from '@/pages/AdminDashboard';
 
 function App() {
@@ -45,6 +49,7 @@ function App() {
                 </AppLayout>
               }
             >
+              {/* Core Routes */}
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/medications" element={<Medications />} />
               <Route path="/reminders" element={<DoseReminders />} />
@@ -59,11 +64,15 @@ function App() {
               <Route path="/reports" element={<MedicalReports />} />
               <Route path="/profile" element={<MyProfile />} />
               <Route path="/settings" element={<Settings />} />
+              
+              {/* USP Feature Routes */}
+              <Route path="/vision" element={<PlatformVision />} />
               <Route path="/myth-busters" element={<MythBusters />} />
               <Route path="/pet-care" element={<PetCare />} />
-              <Route path="/vision" element={<PlatformVision />} />
+              <Route path="/gov-schemes" element={<GovSchemes />} />
               <Route path="/admin" element={<AdminDashboard />} />
             </Route>
+            {/* 404 Fallback */}
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
         </DataProvider>
