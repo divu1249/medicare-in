@@ -21,6 +21,9 @@ import PatientFile from '@/pages/PatientFile';
 import MedicalReports from '@/pages/MedicalReports';
 import MyProfile from '@/pages/MyProfile';
 import Settings from '@/pages/Settings';
+import MythBusters from '@/pages/MythBusters';
+import PetCare from '@/pages/PetCare';
+import PlatformVision from '@/pages/PlatformVision';
 
 function App() {
   useEffect(() => {
@@ -55,6 +58,9 @@ function App() {
               <Route path="/reports" element={<MedicalReports />} />
               <Route path="/profile" element={<MyProfile />} />
               <Route path="/settings" element={<Settings />} />
+	      <Route element="{<MythBusters"/>} path="/myth-busters" />
+	      <Route element="{<PetCare"/>} path="/pet-care" />
+	      <Route element="{<PlatformVision" path="/"/>} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
