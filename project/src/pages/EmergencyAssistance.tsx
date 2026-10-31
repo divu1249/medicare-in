@@ -125,11 +125,16 @@ export default function EmergencyAssistance() {
         
         {/* Live Maps (Online) vs Cached DB (Offline) */}
         {isOnline ? (
-          <button className="flex flex-col items-center justify-center p-4 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/20 transition-all sm:col-span-2 lg:col-span-1">
+          <a 
+            href="https://www.google.com/maps/search/24%2F7+emergency+hospitals+near+me" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            className="flex flex-col items-center justify-center p-4 rounded-xl border-2 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/20 transition-all sm:col-span-2 lg:col-span-1 text-center"
+          >
             <MapPin className="h-8 w-8 mb-2 text-emerald-600 dark:text-emerald-400" />
             <span className="font-bold text-slate-900 dark:text-slate-100">Live Hospital Map</span>
             <span className="text-xs text-slate-500 mt-1">Find 24/7 ERs near you</span>
-          </button>
+          </a>
         ) : (
           <div className="flex flex-col items-center justify-center p-4 rounded-xl border-2 border-rose-200 dark:border-rose-900/50 bg-rose-50 dark:bg-rose-950/10 opacity-75 sm:col-span-2 lg:col-span-1">
             <WifiOff className="h-8 w-8 mb-2 text-rose-500" />
