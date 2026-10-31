@@ -24,6 +24,7 @@ import Settings from '@/pages/Settings';
 import MythBusters from '@/pages/MythBusters';
 import PetCare from '@/pages/PetCare';
 import PlatformVision from '@/pages/PlatformVision';
+import AdminDashboard from '@/pages/AdminDashboard';
 
 function App() {
   useEffect(() => {
@@ -58,9 +59,10 @@ function App() {
               <Route path="/reports" element={<MedicalReports />} />
               <Route path="/profile" element={<MyProfile />} />
               <Route path="/settings" element={<Settings />} />
-	      <Route element="{<MythBusters"/>} path="/myth-busters" />
-	      <Route element="{<PetCare"/>} path="/pet-care" />
-	      <Route element="{<PlatformVision" path="/"/>} />
+              <Route path="/myth-busters" element={<MythBusters />} />
+              <Route path="/pet-care" element={<PetCare />} />
+              <Route path="/vision" element={<PlatformVision />} />
+              <Route path="/admin" element={<AdminDashboard />} />
             </Route>
             <Route path="*" element={<Navigate to="/dashboard" replace />} />
           </Routes>
