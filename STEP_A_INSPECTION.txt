@@ -1,0 +1,2645 @@
+﻿MEDIGUARD STEP A INSPECTION
+
+================================================================================
+FILE: DATABASE_SCHEMA.md
+================================================================================
+# MediGuard â€” Proposed Database Schema
+
+This is a proposed first migration, not an assertion that tables already exist. Use UUID primary keys, UTC `timestamptz` for instants, and explicit timezone identifiers for local scheduling.
+
+## Core tables
+
+### `profiles`
+- `id uuid primary key references auth.users(id) on delete cascade`
+- `display_name text`
+- `timezone text not null default 'Asia/Kolkata'`
+- `locale text not null default 'en'`
+- `created_at`, `updated_at timestamptz not null`
+- No clinical profile or clinician-verification claim.
+
+### `emergency_contacts`
+- `id uuid primary key`
+- `user_id uuid not null references auth.users(id)`
+- `display_name text not null`
+- `relationship_label text`
+- `phone_e164 text not null`
+- `allow_sms_link boolean not null default false`
+- `created_at`, `updated_at timestamptz not null`
+- Consent/escalation settings should be separate, explicit, and revocable.
+
+### `medications`
+- `id uuid primary key`
+- `user_id uuid not null references auth.users(id)`
+- `display_name text not null`
+- `strength_text text` and `form_text text` (user-entered strings; do not parse into clinical recommendations)
+- `entry_source text not null check (entry_source in ('manual','ocr_confirmed'))`
+- `label text not null default 'User-entered'`
+- `archived_at timestamptz`
+- `created_at`, `updated_at timestamptz not null`
+- Do not hard-delete when dose history exists.
+
+### `medication_schedule_versions`
+- `id uuid primary key`
+- `medication_id uuid not null references medications(id)`
+- `user_id uuid not null references auth.users(id)`
+- `version integer not null`
+- `schedule_payload jsonb not null` (validated schema; user-confirmed values only)
+- `timezone text not null`
+- `effective_from timestamptz not null`
+- `effective_until timestamptz`
+- `user_confirmed_at timestamptz not null`
+- `created_at timestamptz not null`
+- `unique(medication_id, version)`
+- Append new versions instead of overwriting prior instructions.
+
+### `dose_events`
+- `id uuid primary key`
+- `user_id uuid not null references auth.users(id)`
+- `medication_id uuid not null references medications(id)`
+- `schedule_version_id uuid references medication_schedule_versions(id)`
+- `scheduled_for timestamptz not null`
+- `timezone text not null`
+- `status text not null check (status in ('scheduled','acknowledged','reported_taken','skipped','missed','cancelled'))`
+- `snoozed_until timestamptz`
+- `reported_taken_at timestamptz`
+- `verification jsonb` nullable (experimental unverified observation only; no images)
+- `created_at`, `updated_at timestamptz not null`
+- Unique idempotency key/constraint based on schedule version and occurrence identity to prevent duplicate generation.
+
+### `dose_event_history`
+- `id uuid primary key`
+- `dose_event_id uuid not null references dose_events(id)`
+- `user_id uuid not null references auth.users(id)`
+- `previous_status text`, `new_status text not null`
+- `actor text not null check (actor in ('user','system'))`
+- `reason text`
+- `created_at timestamptz not null`
+- Append-only from the application perspective; never expose update/delete to normal clients.
+
+### `refill_events`
+- `id uuid primary key`
+- `user_id uuid not null references auth.users(id)`
+- `medication_id uuid not null references medications(id)`
+- `quantity_delta numeric`
+- `event_type text not null check (event_type in ('stock_added','stock_adjusted','refill_reminder'))`
+- `occurred_at timestamptz not null`
+- `notes text`
+- Avoid assuming dose quantity or calculating clinical changes.
+
+## Later tables
+- `caregiver_access_grants`: patient, caregiver identity, explicit scopes, expiry, accepted/revoked timestamps, audit metadata.
+- `notification_attempts`: dose event, channel, attempt state, timestamps, non-sensitive failure code; never treat delivery/open as a dose action.
+- `knowledge_sources`: source organization/title/reference/jurisdiction/retrieval date/trust metadata.
+- `knowledge_item_versions`: content, source metadata, version, reviewer, status, review timestamps.
+- `content_packages`: jurisdiction, locale, version, content hash, publication identity, status, created/published timestamps.
+
+## RLS requirements
+- Enable RLS on every user-owned table.
+- Patient-owned rows: `user_id = auth.uid()` for select/insert/update; restrict deletes and prefer archive.
+- Schedule versions must be owned by the same user as the medication; enforce via transaction/RPC/trigger and tests, not only UI.
+- Dose events must reference medications owned by the same user.
+- `dose_event_history` should be readable only by the owning user and insertable only through a controlled function/transaction; ordinary clients cannot update/delete history.
+- No public access to patient data. Caregiver access is not implicit and must not be added until scoped grants are implemented and tested.
+- Content package publication should be writable only by a dedicated authorized reviewer/service workflow, not normal authenticated users.
+- Add indexes for `(user_id, scheduled_for)`, `(user_id, archived_at)`, and relevant foreign keys.
+
+## Retention and deletion
+Define a documented account deletion/export process before production. Preserve history when archiving medications. Deletion semantics and backups must be explained to users; legal requirements remain unverified.
+
+
+================================================================================
+FILE: API_CONTRACT.md
+================================================================================
+# MediGuard â€” API and Service Contract
+
+## Approach
+Use the Supabase JS client for ordinary authenticated CRUD protected by RLS. Use database functions or Edge Functions only where a transaction, trusted scheduling, publication, or privileged operation is needed. Do not create a generic service-role proxy.
+
+## Client services (planned)
+- `medications.listActive()`
+- `medications.create(input)` â€” user-entered fields only; never infer schedule.
+- `medications.update(id, patch)`
+- `medications.archive(id)` â€” preserve history.
+- `medications.createScheduleVersion(id, confirmedSchedule)`
+- `doseEvents.list(range)`
+- `doseEvents.acknowledge(id)`
+- `doseEvents.reportTaken(id, source='manual')`
+- `doseEvents.skip(id, reason?)`
+- `doseEvents.snooze(id, until)`
+- `emergencyContacts.list/create/update/delete`
+- `contentPackages.getManifest(jurisdiction, locale)`
+- `contentPackages.download(version)` â€” verify expected hash before storing.
+
+## Dose transition contract
+Canonical states: `scheduled`, `acknowledged`, `reported_taken`, `skipped`, `missed`, `cancelled`. Snooze is a separate timestamp. Notification open/dismiss events do not transition a dose.
+
+Suggested allowed transitions:
+- `scheduled â†’ acknowledged | reported_taken | skipped | missed | cancelled`
+- `acknowledged â†’ reported_taken | skipped | missed | cancelled`
+- `missed â†’ reported_taken` only if the product explicitly permits late self-report and the history captures it; otherwise require a correction workflow.
+- `reported_taken`, `skipped`, `cancelled` are terminal in the MVP; corrections should be explicit, audited events rather than silent overwrites.
+- `missed` is set by a trusted server process only after a documented grace rule. Do not infer that a person did or did not ingest medication.
+
+Every transition writes `dose_event_history` atomically with the current state update. Retry-safe calls use idempotency keys or compare-and-set semantics.
+
+## Error envelope
+Return stable, non-clinical error codes such as:
+- `UNAUTHENTICATED`
+- `FORBIDDEN`
+- `VALIDATION_ERROR`
+- `NOT_FOUND`
+- `CONFLICT`
+- `RATE_LIMITED`
+- `TEMPORARY_UNAVAILABLE`
+
+Do not include tokens, full medical payloads, or internal secrets in errors/logs.
+
+## Reminders
+- Browser/in-app notifications are best-effort and platform-dependent.
+- A notification attempt is not proof of delivery, opening, acknowledgement, or ingestion.
+- Missed marking is server-side, idempotent, and based on an explicitly documented threshold; do not send clinical advice in escalation messages.
+- Caregiver notifications are out of MVP; do not send to a contact without a future accepted grant and explicit scope/consent.
+
+## Offline emergency package
+Manifest fields: `package_id`, `jurisdiction`, `locale`, `version`, `published_at`, `content_hash`, `review_status`, `items[]`.
+Each item requires: `item_id`, `title`, `body`, `source_organization`, `source_title`, `source_reference`, `publication_or_revision_date`, `retrieved_at`, `jurisdiction`, `version`, `review_status`, `reviewer_id`.
+Only packages marked published/approved by the controlled publisher are installable. Validate schema and hash before replacing the last known-good package. Never let an update failure erase the working offline package.
+
+## Emergency contact actions
+`tel:` and `sms:` links open the corresponding device application. UI must state that the user still needs to place/send the call/message. Never report that a call was placed or help dispatched.
+
+
+================================================================================
+FILE: ARCHITECTURE.md
+================================================================================
+# MediGuard â€” Architecture
+
+## Decision record
+- **Frontend:** Existing React 18 + TypeScript + Vite app under `project/`; preserve existing UI and migrate incrementally.
+- **Backend:** Supabase Auth + PostgreSQL + Row Level Security (RLS) + Edge Functions.
+- **Offline store:** IndexedDB for approved content packages and minimal emergency contact data; service worker for app shell/static assets.
+- **No separate Node/FastAPI server in the MVP.** Reconsider only if a demonstrated requirement cannot be met safely with Supabase.
+- **AI:** No AI-generated clinical guidance in the MVP. A later audit workflow may flag source conflicts for human review.
+
+## Logical components
+1. **React UI:** routes and components; forms validate inputs but are not the security boundary.
+2. **Domain services:** typed modules for medications, dose events, emergency contacts, and content packages. Avoid making `DataContext` a monolithic backend client.
+3. **Supabase client:** browser-safe URL + anon/publishable key only; user JWT is managed by Supabase Auth.
+4. **Postgres + RLS:** durable user-owned records; every table exposed to the client has explicit grants and policies.
+5. **Edge Functions / scheduled job:** privileged or trusted workflows only, with strict authentication, authorization, idempotency, rate limits, and minimal logs.
+6. **Offline emergency library:** previously downloaded, human-approved, versioned package; no network/LLM dependency for reading it.
+7. **Content governance (later):** source registry â†’ automated checks/flags â†’ human review â†’ authorized publication â†’ signed/hashed package.
+
+## Data flow
+- User signs in â†’ Supabase Auth session â†’ client queries tables through RLS.
+- User creates medication/schedule â†’ validated service â†’ RLS-protected rows.
+- Scheduler materializes dose events idempotently for a bounded future horizon; local UI notifications are best-effort, not guaranteed background alarms.
+- User explicitly reports taken/skipped â†’ append audit event and update current state in a transaction/RPC or Edge Function where needed.
+- Emergency package is fetched while online, integrity-checked, stored in IndexedDB, then rendered offline.
+- Contact links open device dialer/messaging app; the app does not send or claim dispatch itself.
+
+## Suggested frontend organization
+```text
+project/src/
+  lib/supabase.ts
+  services/
+    medications.ts
+    doseEvents.ts
+    emergencyContacts.ts
+    contentPackages.ts
+  types/
+    domain.ts
+  context/
+    AuthContext.tsx
+    DataContext.tsx   # temporary UI adapter; gradually slim down
+  features/
+    medications/
+    dose-history/
+    emergency/
+    library/
+  hooks/
+  components/
+```
+
+## Migration strategy
+1. Add architecture and safety docs before changing runtime behavior.
+2. Introduce canonical domain types and explicit mapping from legacy localStorage/demo types.
+3. Add Supabase schema, RLS, and policies before wiring production reads/writes.
+4. Add auth/profile and core medication CRUD.
+5. Add immutable schedule versions and dose event history.
+6. Add offline package manifest, integrity validation, and reviewed-content metadata.
+7. Migrate screens feature-by-feature; remove mock data only when each screen has a verified replacement.
+8. Add automated tests and a staging review before enabling reminders or user data migration.
+
+## Operational constraints
+- `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (or publishable key) are public client configuration, not secrets.
+- Never put a Supabase service-role key in Vite variables or client bundles.
+- Supabase Edge Functions must verify caller identity and authorization; service-role access bypasses RLS and must be narrowly scoped.
+- Client-side timers and browser notifications cannot guarantee delivery while a browser/PWA is closed. Do not market them as guaranteed medication alarms.
+- Package hashes detect accidental/tampered bytes only when compared to a trusted expected hash; they do not prove reviewer identity. Publication authorization and transport must be controlled.
+
+
+================================================================================
+FILE: PRODUCT_SPEC.md
+================================================================================
+# MediGuard â€” Product Specification
+
+**Status:** Draft v1  
+**Primary jurisdiction:** India (`IN`)  
+**Default locale:** `en`  
+**Default timezone:** `Asia/Kolkata`  
+**Product class:** Medication-adherence and offline emergency-information helper; not a clinical system.
+
+## Purpose
+Help a person follow their own prescribed medication schedule, keep a self-reported dose history, access reviewed emergency-information packages offline, and optionally share bounded missed-dose alerts with an explicitly authorized caregiver.
+
+## Non-goals
+MediGuard is not a clinician, pharmacist, diagnostic tool, emergency dispatcher, medication recommender, or proof of ingestion. No clinician-verification workflow is part of the MVP.
+
+## Safety requirements
+- **SAFE-1 â€” No clinical decisions:** Never diagnose, prescribe, recommend a medication, or tell a user to start, stop, or change medication or dosage.
+- **SAFE-2 â€” Schedule provenance:** Schedules come from user entry or OCR followed by user confirmation. The system never infers a schedule. Ambiguous instructions remain as entered and are flagged to ask a clinician/pharmacist.
+- **SAFE-3 â€” Explicit dose action:** Opening or dismissing a notification never changes dose status. Only an explicit user action can report a dose taken, skipped, or otherwise acknowledged.
+- **SAFE-4 â€” Canonical dose states:** `scheduled`, `acknowledged`, `reported_taken`, `skipped`, `missed`, `cancelled`. Snooze is `snoozed_until`, not a status. Camera output is a separate `verification` observation.
+- **SAFE-5 â€” User-entered label:** User-entered medication information must be labeled â€œUser-enteredâ€; MVP must not claim clinician verification.
+- **SAFE-6 â€” Camera limits:** Camera analysis is optional and experimental. Store an unverified observation and confidence only; never claim ingestion confirmed. Keep frames on-device and do not store them. Manual reporting always remains available.
+- **SAFE-7 â€” Bounded escalation:** Escalation changes who is informed, not medical instructions. It is opt-in, bounded, visible, and revocable.
+- **SAFE-8 â€” Approved content only:** User-facing emergency guidance comes only from published, human-approved, versioned, sourced packages. AI output is never directly shown as guidance.
+- **SAFE-9 â€” Content provenance:** Every published item records source organization, title, URL/reference, publication/revision date, retrieval date, jurisdiction, version, review status, and reviewer.
+- **SAFE-10 â€” Conflict handling:** Conflicting, outdated, or unsupported content is routed to human review. The system never chooses a clinical recommendation.
+- **SAFE-11 â€” Offline access:** After the app and package have loaded once, the emergency library, emergency contacts card, and call/message links must work offline without login, LLM, or paid API access.
+- **SAFE-12 â€” No dispatch claims:** `tel:` and `sms:` links merely open the device app. MediGuard must never claim that help was dispatched.
+- **SAFE-13 â€” Facility uncertainty:** Facility information is approximate/unverified unless supplied by a trusted provider. Never invent opening hours, capacity, or travel time.
+- **SAFE-14 â€” Privacy:** Medical data is sensitive. Obtain consent before caregiver sharing or external AI/provider processing. Never log PHI, access tokens, or secrets.
+
+## MVP scope
+1. Account/profile and timezone.
+2. Emergency contacts.
+3. Medication create/edit/archive; schedule versions; stock and refill events.
+4. Dose events and self-reported dose history.
+5. Reminder UI and in-app/browser notifications while supported; server-side missed marking only after explicit, documented rules.
+6. Baseline offline emergency library built from reviewed content packages.
+7. Client-side Tesseract OCR that requires user review and confirmation.
+8. Experimental camera motion-difference prototype, isolated from dose status.
+9. Client-side PDF report generated from authorized API data.
+
+## Later / out of MVP
+- Caregiver invitations and scoped grants; web push and bounded escalation.
+- Versioned IndexedDB package updates.
+- Document upload management.
+- Facility-provider integration/manual location fallback.
+- Knowledge-base audit pipeline and reviewer publication console.
+- Server OCR, semantic search, smart pillbox, computer-vision classifier.
+
+## Existing UI reconciliation
+- â€œAI Health Advisorâ€ becomes Library Q&A over approved content only; no generative clinical answers in MVP.
+- Labs/Visits remain clearly labeled demo content until persistence and provenance exist.
+- Inventory/refill lives on medication and `refill_events`.
+- Reports use jsPDF in the client, populated from API responses.
+- Hospital directory stays clearly marked â€œSampleâ€ until a real provider is integrated.
+
+## Metrics
+Reported adherence for a period is:
+`reported_taken / (reported_taken + skipped + missed)` across resolved dose events in that period. Label it **self-reported**. Exclude `scheduled`, `acknowledged`, and `cancelled` from the denominator.
+
+## Terminology
+A **dose event** is one scheduled occurrence at a local date/time, stored with a timezone-aware timestamp. A **content package** is a versioned JSON bundle of approved item versions for a jurisdiction and locale, identified by a cryptographic hash. A hash alone does not establish reviewer identity or authorization.
+
+
+================================================================================
+FILE: IMPLEMENTATION_PLAN.md
+================================================================================
+# MediGuard â€” Implementation Plan
+
+## Decisions locked
+- Backend: Supabase Auth + Postgres/RLS + Edge Functions as needed.
+- First milestone: core account + medication CRUD + dose history.
+- Repository approach: docs first; implementation follows approved contracts.
+- Existing React/Vite frontend is retained and migrated incrementally.
+
+## Phase 0 â€” Documentation and baseline
+- [x] Capture product safety requirements and scope.
+- [x] Document architecture, schema, service contract, privacy/security, and knowledge governance.
+- [ ] Verify actual default branch, scripts, current dependency versions, and complete route/type usage before implementation.
+- [ ] Run existing build and typecheck; record baseline failures before changing code.
+- [ ] Confirm `.env` is ignored and scan for accidentally committed secrets.
+
+## Phase 1 â€” Domain types and data boundary
+- Replace legacy dose vocabulary (`taken`, `not_confirmed`) with the canonical state model through explicit migrations/mappers; do not do a blind global replace.
+- Separate camera observation from dose status.
+- Define typed domain objects and service interfaces.
+- Keep demo data isolated and visibly marked; avoid nondeterministic sample history.
+- Preserve medication history through archive rather than cascading delete.
+
+## Phase 2 â€” Supabase foundation
+- Create project and local environment variables.
+- Add SQL migrations for core tables, constraints, indexes, RLS policies, and history-writing transaction.
+- Test RLS with two users and negative cross-account access cases.
+- Add AuthContext and safe session/error handling.
+- Never commit credentials or service-role keys.
+
+## Phase 3 â€” Core milestone
+- Medication list/create/edit/archive.
+- User-confirmed schedule versions.
+- Dose event generation with stable occurrence identity/idempotency.
+- Dose event list and explicit acknowledge/report-taken/skip/snooze actions.
+- Append-only history and self-reported adherence calculation.
+- Loading, empty, error, offline, and permission states.
+- Tests for transitions, timezone/DST boundaries, duplicate generation, and authorization.
+
+## Phase 4 â€” Offline emergency library
+- Define package JSON schema and reviewed content metadata.
+- Build package manifest/hash validation and IndexedDB storage.
+- Preserve last known-good package on update failure.
+- Verify emergency contacts and call/message links work offline after initial load.
+- Replace or disable unprovenanced demo guidance until reviewed.
+
+## Phase 5 â€” Reminder reliability
+- Document actual notification limitations per browser/platform.
+- Add server-side missed marking only after grace period and transition policy are approved.
+- Add idempotent notification attempts and rate limiting.
+- Caregiver escalation remains out of scope until consent/grants are implemented.
+
+## Phase 6 â€” Hardening and release review
+- RLS/security tests, accessibility, mobile/responsive checks, offline tests, dependency/secret scan.
+- Data export and account deletion behavior.
+- Privacy notice and consent copy reviewed.
+- Clinical content and local emergency configuration reviewed by qualified people.
+- Do not claim regulatory compliance without a separate review.
+
+## Definition of done for core milestone
+- Authenticated users can manage only their own records.
+- A medication can be archived without deleting historical doses.
+- Schedules are explicitly user-confirmed and versioned.
+- Dose states match the canonical enum and transitions are audited.
+- Notification interactions never mark doses taken.
+- Camera observations cannot change dose state.
+- No real medical guidance is presented without approved provenance.
+- Build/typecheck and relevant tests pass, or remaining failures are documented.
+
+
+================================================================================
+FILE: SECURITY_AND_PRIVACY.md
+================================================================================
+# MediGuard â€” Security and Privacy Baseline
+
+## Threat model
+Sensitive assets include medication names/schedules, dose history, emergency contacts, account identifiers, access tokens, and optional caregiver relationships. Threats include cross-account access, leaked client secrets, overbroad caregiver access, logs containing health data, compromised dependencies, malicious package updates, and accidental loss of offline emergency information.
+
+## Required controls
+1. Enable RLS on every user-owned table and test both allowed and denied cross-user access.
+2. Keep only Supabase URL and anon/publishable key in the browser. Never expose service-role keys or other secrets in `VITE_*`, source control, logs, or browser storage.
+3. Validate all input server-side where security matters. Client-side validation improves UX but is not authorization.
+4. Use least privilege for Edge Functions and publication workflows; authenticate caller and authorize the requested record/scope.
+5. Avoid logging request bodies or medical data. Redact authorization headers, tokens, phone numbers, and user-provided notes.
+6. Require explicit, revocable consent before any future caregiver sharing or external AI/provider processing.
+7. Do not upload camera frames. Camera analysis is optional, on-device, and returns only a separately stored unverified observation.
+8. Do not persist OCR source images unless a separately reviewed requirement is added; user must confirm extracted text.
+9. Treat all medication entries as â€œUser-entered.â€ No clinician verification claim in MVP.
+10. Keep approved emergency content available offline; validate package schema/hash and preserve last known-good package on failed updates.
+11. Apply dependency updates, secret scanning, and lockfile review. Verify `.env` is ignored and no secrets have been committed.
+12. Implement account export/deletion and explain retention before production use.
+
+## Authentication and session
+- Use Supabase Auth-supported session handling; do not build a custom token store.
+- Sign-out should clear authenticated application state while leaving only the minimal offline emergency package/contact data that the user knowingly opted to retain.
+- Avoid caching authenticated API responses in the service worker cache.
+- Do not place private data in URL query strings.
+
+## Logging and analytics
+- Log operation identifiers, coarse outcomes, and non-sensitive error codes only.
+- Never log PHI, medication schedules, access tokens, service keys, raw OCR text, camera frames, or emergency contact details.
+- Analytics must be optional and must not contain health data by default.
+
+## Release gate
+Before any public/real-user deployment, review RLS policies, test account isolation, inspect build output for secrets, test offline access, test export/deletion, review third-party data flows, and obtain appropriate privacy/legal review. Compliance status is currently unverified; do not claim regulatory compliance.
+
+
+================================================================================
+FILE: AI_KNOWLEDGE_AUDIT.md
+================================================================================
+# MediGuard â€” AI and Knowledge Audit Governance
+
+## MVP boundary
+No LLM-generated medical guidance is shown to users. The Library Q&A may retrieve or display only approved, versioned content items. If a question cannot be answered from approved items, say the library does not contain a reviewed answer and direct the user to a qualified professional or local emergency service as appropriateâ€”without inventing instructions.
+
+## Future audit pipeline
+1. **Ingest metadata:** source organization, title, URL/reference, jurisdiction, publication/revision date, retrieval date, content type, and permitted-use notes.
+2. **Validate:** schema, URL availability where feasible, required provenance, jurisdiction, dates, version, and source allow-list.
+3. **Compare:** detect possible conflicts, stale versions, missing citations, unsupported claims, and duplicate/near-duplicate items.
+4. **Flag, never decide:** AI or automated checks may produce internal flags with evidence and confidence; they must not select between conflicting clinical recommendations or publish content.
+5. **Human review:** authorized reviewer checks source and content, records identity, decision, rationale, and review timestamp.
+6. **Publish:** controlled workflow creates an immutable version and package manifest; only approved versions enter user-facing packages.
+7. **Distribute:** client validates schema and trusted hash/signature and keeps the previous package if the update fails.
+8. **Audit:** preserve version history and who/what approved each publication.
+
+## Required item metadata
+`source_organization`, `source_title`, `source_reference`, `publication_or_revision_date`, `retrieved_at`, `jurisdiction`, `locale`, `version`, `review_status`, `reviewer_id`, `reviewed_at`, `content_hash`.
+
+## Review statuses
+Suggested values: `draft`, `needs_review`, `approved`, `rejected`, `superseded`, `withdrawn`. Only `approved` and currently published versions are user-visible. Withdrawal/supersession must propagate in the next package update and be clearly handled offline.
+
+## Prompt-injection and source safety
+Treat source pages, uploaded documents, OCR text, and retrieved content as untrusted dataâ€”not instructions to the AI pipeline. Never allow source text to change system policy, invoke tools, expose secrets, or publish itself. Separate content from metadata and sanitize rendered HTML.
+
+## Clinical-content policy
+Use authoritative, jurisdiction-appropriate sources selected by a qualified reviewer. Do not fabricate sources or dates. Do not publish first-aid/CPR/medication-specific material until a human reviewer confirms the exact content, jurisdiction, and currency. Conflicts and uncertain evidence remain blocked for review.
+
+
+================================================================================
+FILE: GEMINI_HANDOFF.md
+================================================================================
+# MediGuard â€” Implementation Handoff
+
+Use this file as the implementation prompt for a coding agent.
+
+## Repository facts from the initial audit
+- Frontend lives in `project/`.
+- React 18 + TypeScript + Vite 7; React Router, Tailwind, Lucide, Recharts, jsPDF.
+- Supabase JS dependency is installed, but inspected `DataContext.tsx` is localStorage/demo-data based.
+- `src/types/index.ts` uses legacy dose statuses including `taken` and `not_confirmed`, which conflict with the product spec.
+- `deleteMedication` currently removes associated dose records; change to archive semantics.
+- `demoData.ts` contains sample profile/medication/contact/article content; keep demo content clearly marked and do not treat it as verified medical content.
+- `src/lib/offline.ts` and `public/sw.js` provide basic offline groundwork, not versioned reviewed content packages.
+- Tesseract.js is present for client-side OCR. Camera monitoring is a prototype and must remain separate from dose state.
+- These are findings from key-file inspection, not a claim that every file or test has been audited.
+
+## Instructions
+1. Read `docs/PRODUCT_SPEC.md`, `docs/ARCHITECTURE.md`, `docs/DATABASE_SCHEMA.md`, `docs/API_CONTRACT.md`, and `docs/SECURITY_AND_PRIVACY.md` before editing.
+2. Inspect the actual repository, package scripts, current routes, all usages of dose statuses, and all medication deletion paths.
+3. Work on a feature branch. Do not overwrite unrelated user work.
+4. Start by reporting the current build/typecheck/test baseline; do not silently fix unrelated errors.
+5. Implement the core milestone in small reviewable changes: Supabase setup, schema/RLS, auth, medication CRUD/archive, schedule versions, dose events/history.
+6. Never put service-role credentials in the frontend. Do not claim RLS exists until SQL policies and tests have been added.
+7. Keep all medical content out of generated AI answers. No clinical advice, prescription inference, or schedule inference.
+8. Every OCR-derived schedule requires explicit user confirmation. Camera output is an unverified observation, never ingestion confirmation.
+9. Notification open/dismiss never changes dose state. Only explicit user actions do.
+10. Do not delete history when archiving medications. Use append-only dose event history.
+11. Do not implement caregiver sharing, escalation, facility claims, or AI medical Q&A in this milestone.
+12. After each step, run relevant checks and report files changed, commands run, results, assumptions, and remaining risks.
+
+## Expected first deliverables
+- Domain type/migration proposal.
+- SQL migration with core tables, constraints, RLS policies, and test plan.
+- `src/lib/supabase.ts` using public environment variables only.
+- Service modules separated from `DataContext`.
+- Auth + medication CRUD + archive + dose history, integrated incrementally.
+- Tests for cross-user access, dose transitions, idempotency, and history preservation.
+
+
+================================================================================
+FILE: src\App.tsx
+================================================================================
+import { useEffect } from 'react';
+import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
+import AppLayout from '@/components/AppLayout';
+import { DataProvider } from '@/context/DataContext';
+import { ToastProvider } from '@/components/ui/Toast';
+import { initTheme } from '@/lib/theme';
+import { registerServiceWorker } from '@/lib/offline';
+
+import LandingPage from '@/pages/LandingPage';
+import Dashboard from '@/pages/Dashboard';
+import Medications from '@/pages/Medications';
+import DoseReminders from '@/pages/DoseReminders';
+import CameraMonitoring from '@/pages/CameraMonitoring';
+import Inventory from '@/pages/Inventory';
+import RefillAlerts from '@/pages/RefillAlerts';
+import EmergencyAssistance from '@/pages/EmergencyAssistance';
+import EmergencyGuide from '@/pages/EmergencyGuide';
+import MedicalLibrary from '@/pages/MedicalLibrary';
+import AIHealthAdvisor from '@/pages/AIHealthAdvisor';
+import PatientFile from '@/pages/PatientFile';
+import MedicalReports from '@/pages/MedicalReports';
+import MyProfile from '@/pages/MyProfile';
+import Settings from '@/pages/Settings';
+
+function App() {
+  useEffect(() => {
+    initTheme();
+    registerServiceWorker();
+  }, []);
+
+  return (
+    <BrowserRouter>
+      <ToastProvider>
+        <DataProvider>
+          <Routes>
+            <Route path="/" element={<LandingPage />} />
+            <Route
+              element={
+                <AppLayout>
+                  <Outlet />
+                </AppLayout>
+              }
+            >
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/medications" element={<Medications />} />
+              <Route path="/reminders" element={<DoseReminders />} />
+              <Route path="/camera-monitoring" element={<CameraMonitoring />} />
+              <Route path="/inventory" element={<Inventory />} />
+              <Route path="/refill-alerts" element={<RefillAlerts />} />
+              <Route path="/emergency" element={<EmergencyAssistance />} />
+              <Route path="/emergency-guide" element={<EmergencyGuide />} />
+              <Route path="/library" element={<MedicalLibrary />} />
+              <Route path="/ai-advisor" element={<AIHealthAdvisor />} />
+              <Route path="/patient-file" element={<PatientFile />} />
+              <Route path="/reports" element={<MedicalReports />} />
+              <Route path="/profile" element={<MyProfile />} />
+              <Route path="/settings" element={<Settings />} />
+            </Route>
+            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+          </Routes>
+        </DataProvider>
+      </ToastProvider>
+    </BrowserRouter>
+  );
+}
+
+export default App;
+
+
+================================================================================
+FILE: src\lib\medUtils.ts
+================================================================================
+import type { Medication, DoseRecord, RefillEvent } from '@/types';
+
+export function todayISO(offsetDays = 0): string {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return d.toISOString().split('T')[0];
+}
+
+export function formatDate(iso: string): string {
+  if (!iso) return 'Not provided';
+  const d = new Date(iso + (iso.length === 10 ? 'T00:00:00' : ''));
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+export function formatTime(t: string): string {
+  if (!t) return '';
+  const [h, m] = t.split(':');
+  const hour = parseInt(h, 10);
+  const ampm = hour >= 12 ? 'PM' : 'AM';
+  const h12 = hour % 12 || 12;
+  return `${h12}:${m} ${ampm}`;
+}
+
+export function daysBetween(a: string, b: string): number {
+  const d1 = new Date(a + 'T00:00:00').getTime();
+  const d2 = new Date(b + 'T00:00:00').getTime();
+  return Math.round((d2 - d1) / 86400000);
+}
+
+export function estimateSupply(med: Medication): { daysRemaining: number; runOutDate: string } | null {
+  const dosesPerDay = med.times.length || 1;
+  const usedPerDay = med.quantityPerDose * dosesPerDay;
+  if (usedPerDay <= 0 || med.quantity <= 0) return null;
+  const daysRemaining = Math.floor(med.quantity / usedPerDay);
+  const runOut = new Date();
+  runOut.setDate(runOut.getDate() + daysRemaining);
+  return { daysRemaining, runOutDate: runOut.toISOString().split('T')[0] };
+}
+
+export function isLowStock(med: Medication): boolean {
+  return med.quantity <= med.lowStockThreshold;
+}
+
+export function getAdherenceStats(doses: DoseRecord[]): { rate: number; taken: number; total: number; missed: number; skipped: number } {
+  const past = doses.filter((d) => d.status !== 'scheduled' || d.scheduledDate < todayISO());
+  const total = past.length || 1;
+  const taken = past.filter((d) => d.status === 'taken').length;
+  const missed = past.filter((d) => d.status === 'missed').length;
+  const skipped = past.filter((d) => d.status === 'skipped').length;
+  return { rate: Math.round((taken / total) * 100), taken, total, missed, skipped };
+}
+
+export function getTodayDoses(doses: DoseRecord[], medications: Medication[]): DoseRecord[] {
+  const today = todayISO();
+  const medIds = new Set(medications.map((m) => m.id));
+  return doses
+    .filter((d) => d.scheduledDate === today && medIds.has(d.medicationId))
+    .sort((a, b) => a.scheduledTime.localeCompare(b.scheduledTime));
+}
+
+export function getRefillAlerts(medications: Medication[]): { med: Medication; daysRemaining: number; runOutDate: string }[] {
+  const alerts: { med: Medication; daysRemaining: number; runOutDate: string }[] = [];
+  medications.forEach((med) => {
+    if (isLowStock(med)) {
+      const est = estimateSupply(med);
+      alerts.push({ med, daysRemaining: est?.daysRemaining ?? 0, runOutDate: est?.runOutDate ?? 'Unknown' });
+    }
+  });
+  return alerts.sort((a, b) => a.daysRemaining - b.daysRemaining);
+}
+
+export function uid(prefix = ''): string {
+  return `${prefix}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function getDosesForDate(doses: DoseRecord[], medications: Medication[], date: string): DoseRecord[] {
+  const medIds = new Set(medications.map((m) => m.id));
+  return doses
+    .filter((d) => d.scheduledDate === date && medIds.has(d.medicationId))
+    .sort((a, b) => a.scheduledTime.localeCompare(b.scheduledTime));
+}
+
+export function ensureTodayDoses(doses: DoseRecord[], medications: Medication[]): DoseRecord[] {
+  const today = todayISO();
+  const existing = new Set(doses.filter((d) => d.scheduledDate === today).map((d) => `${d.medicationId}-${d.scheduledTime}`));
+  const newDoses: DoseRecord[] = [];
+  medications.forEach((med) => {
+    med.times.forEach((time) => {
+      const key = `${med.id}-${time}`;
+      if (!existing.has(key)) {
+        newDoses.push({
+          id: uid('dose-'),
+          medicationId: med.id,
+          medicationName: med.name,
+          scheduledDate: today,
+          scheduledTime: time,
+          dosage: `${med.dosage} ${med.unit}`,
+          status: 'scheduled',
+          confirmedAt: null,
+          monitoringStatus: 'scheduled',
+          source: 'manual',
+          note: '',
+        });
+      }
+    });
+  });
+  return newDoses.length > 0 ? [...doses, ...newDoses] : doses;
+}
+
+export function refillHistoryForMed(refills: RefillEvent[], medId: string): RefillEvent[] {
+  return refills.filter((r) => r.medicationId === medId).sort((a, b) => b.date.localeCompare(a.date));
+}
+
+
+================================================================================
+FILE: src\types\index.ts
+================================================================================
+export type DoseStatus =
+  | 'scheduled'
+  | 'taken'
+  | 'skipped'
+  | 'not_confirmed'
+  | 'missed';
+
+export type MonitoringStatus =
+  | 'scheduled'
+  | 'monitoring'
+  | 'waiting'
+  | 'movement_detected'
+  | 'review'
+  | 'confirmed'
+  | 'not_confirmed'
+  | 'missed';
+
+export interface Medication {
+  id: string;
+  name: string;
+  dosage: string;
+  unit: string;
+  times: string[];
+  frequency: string;
+  duration: string;
+  instructions: string;
+  startDate: string;
+  endDate: string;
+  quantity: number;
+  quantityPerDose: number;
+  lowStockThreshold: number;
+  expiryDate: string;
+  notes: string;
+  pharmacy: string;
+  createdAt: string;
+}
+
+export interface DoseRecord {
+  id: string;
+  medicationId: string;
+  medicationName: string;
+  scheduledDate: string;
+  scheduledTime: string;
+  dosage: string;
+  status: DoseStatus;
+  confirmedAt: string | null;
+  monitoringStatus: MonitoringStatus;
+  source: 'manual' | 'camera' | 'simulated';
+  note: string;
+}
+
+export interface RefillEvent {
+  id: string;
+  medicationId: string;
+  medicationName: string;
+  date: string;
+  quantity: number;
+  type: 'purchase' | 'refill' | 'update';
+}
+
+export interface EmergencyContact {
+  id: string;
+  name: string;
+  relationship: string;
+  phone: string;
+}
+
+export interface PatientProfile {
+  fullName: string;
+  patientId: string;
+  dateOfBirth: string;
+  age: string;
+  gender: string;
+  bloodGroup: string;
+  address: string;
+  phone: string;
+  email: string;
+  emergencyContacts: EmergencyContact[];
+  allergies: string[];
+  conditions: string[];
+  medicalAlerts: string[];
+  providerName: string;
+  providerSpecialty: string;
+  providerPhone: string;
+  hospitalName: string;
+  hospitalAddress: string;
+  caregiverName: string;
+  caregiverPhone: string;
+  additionalInfo: string;
+}
+
+export interface LabReport {
+  id: string;
+  date: string;
+  testName: string;
+  result: string;
+  normalRange: string;
+  status: 'normal' | 'abnormal' | 'pending';
+  isSample: boolean;
+}
+
+export interface VisitRecord {
+  id: string;
+  date: string;
+  doctor: string;
+  reason: string;
+  notes: string;
+  isSample: boolean;
+}
+
+export interface MedicalReport {
+  id: string;
+  reportId: string;
+  type: string;
+  title: string;
+  generatedDate: string;
+  dateRange: string;
+  sections: string[];
+  data: string;
+}
+
+export interface LibraryArticle {
+  id: string;
+  title: string;
+  category: string;
+  summary: string;
+  content: string;
+  source: string;
+  publishedDate: string;
+  tags: string[];
+  offline: boolean;
+}
+
+export interface Bookmark {
+  id: string;
+  articleId: string;
+  savedDate: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+}
+
+export type ThemeMode = 'light' | 'dark' | 'system';
+
+export interface AppSettings {
+  theme: ThemeMode;
+  reminderEnabled: boolean;
+  reminderLeadMinutes: number;
+  snoozeMinutes: number;
+  cameraEnabled: boolean;
+  monitoringWindowMinutes: number;
+  notificationsEnabled: boolean;
+  defaultReportType: string;
+}
+
+
+================================================================================
+FILE: src\context\DataContext.tsx
+================================================================================
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+  type ReactNode,
+} from 'react';
+import type {
+  Medication,
+  DoseRecord,
+  RefillEvent,
+  PatientProfile,
+  LabReport,
+  VisitRecord,
+  MedicalReport,
+  Bookmark,
+  ChatMessage,
+  AppSettings,
+  DoseStatus,
+} from '@/types';
+import {
+  defaultProfile,
+  defaultMedications,
+  defaultDoses,
+  defaultRefills,
+  defaultLabReports,
+  defaultVisits,
+  defaultReports,
+  defaultSettings,
+} from '@/data/demoData';
+import { getTheme, setTheme } from '@/lib/theme';
+
+const KEYS = {
+  profile: 'medicare-profile',
+  medications: 'medicare-medications',
+  doses: 'medicare-doses',
+  refills: 'medicare-refills',
+  labs: 'medicare-labs',
+  visits: 'medicare-visits',
+  reports: 'medicare-reports',
+  bookmarks: 'medicare-bookmarks',
+  chat: 'medicare-chat',
+  settings: 'medicare-settings',
+};
+
+function load<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function save<T>(key: string, value: T) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* storage may be full or blocked */
+  }
+}
+
+export interface DataContextValue {
+  profile: PatientProfile;
+  setProfile: (p: PatientProfile) => void;
+  medications: Medication[];
+  addMedication: (m: Medication) => void;
+  updateMedication: (m: Medication) => void;
+  deleteMedication: (id: string) => void;
+  doses: DoseRecord[];
+  addDose: (d: DoseRecord) => void;
+  updateDose: (id: string, patch: Partial<DoseRecord>) => void;
+  setDoseStatus: (id: string, status: DoseStatus, source?: DoseRecord['source']) => void;
+  refills: RefillEvent[];
+  addRefill: (r: RefillEvent) => void;
+  labs: LabReport[];
+  visits: VisitRecord[];
+  reports: MedicalReport[];
+  addReport: (r: MedicalReport) => void;
+  bookmarks: Bookmark[];
+  toggleBookmark: (articleId: string) => void;
+  chat: ChatMessage[];
+  addChatMessage: (m: ChatMessage) => void;
+  clearChat: () => void;
+  settings: AppSettings;
+  updateSettings: (patch: Partial<AppSettings>) => void;
+  resetDemoData: () => void;
+}
+
+const DataContext = createContext<DataContextValue | null>(null);
+
+export function DataProvider({ children }: { children: ReactNode }) {
+  const [profile, setProfileState] = useState<PatientProfile>(() => load(KEYS.profile, defaultProfile));
+  const [medications, setMedications] = useState<Medication[]>(() => load(KEYS.medications, defaultMedications));
+  const [doses, setDoses] = useState<DoseRecord[]>(() => load(KEYS.doses, defaultDoses));
+  const [refills, setRefills] = useState<RefillEvent[]>(() => load(KEYS.refills, defaultRefills));
+  const [labs] = useState<LabReport[]>(() => load(KEYS.labs, defaultLabReports));
+  const [visits] = useState<VisitRecord[]>(() => load(KEYS.visits, defaultVisits));
+  const [reports, setReports] = useState<MedicalReport[]>(() => load(KEYS.reports, defaultReports));
+  const [bookmarks, setBookmarks] = useState<Bookmark[]>(() => load(KEYS.bookmarks, []));
+  const [chat, setChat] = useState<ChatMessage[]>(() => load(KEYS.chat, []));
+  const [settings, setSettings] = useState<AppSettings>(() => ({ ...defaultSettings, ...load(KEYS.settings, {}) as Partial<AppSettings> }));
+
+  useEffect(() => save(KEYS.profile, profile), [profile]);
+  useEffect(() => save(KEYS.medications, medications), [medications]);
+  useEffect(() => save(KEYS.doses, doses), [doses]);
+  useEffect(() => save(KEYS.refills, refills), [refills]);
+  useEffect(() => save(KEYS.reports, reports), [reports]);
+  useEffect(() => save(KEYS.bookmarks, bookmarks), [bookmarks]);
+  useEffect(() => save(KEYS.chat, chat), [chat]);
+  useEffect(() => save(KEYS.settings, settings), [settings]);
+
+  const setProfile = useCallback((p: PatientProfile) => setProfileState(p), []);
+
+  const addMedication = useCallback((m: Medication) => setMedications((prev) => [...prev, m]), []);
+  const updateMedication = useCallback((m: Medication) => setMedications((prev) => prev.map((x) => (x.id === m.id ? m : x))), []);
+  const deleteMedication = useCallback((id: string) => {
+    setMedications((prev) => prev.filter((x) => x.id !== id));
+    setDoses((prev) => prev.filter((d) => d.medicationId !== id));
+  }, []);
+
+  const addDose = useCallback((d: DoseRecord) => setDoses((prev) => [...prev, d]), []);
+  const updateDose = useCallback((id: string, patch: Partial<DoseRecord>) =>
+    setDoses((prev) => prev.map((d) => (d.id === id ? { ...d, ...patch } : d))), []);
+  const setDoseStatus = useCallback((id: string, status: DoseStatus, source: DoseRecord['source'] = 'manual') =>
+    setDoses((prev) => prev.map((d) => (d.id === id ? { ...d, status, source, confirmedAt: status === 'taken' ? new Date().toISOString() : null } : d))), []);
+
+  const addRefill = useCallback((r: RefillEvent) => setRefills((prev) => [...prev, r]), []);
+
+  const addReport = useCallback((r: MedicalReport) => setReports((prev) => [r, ...prev]), []);
+
+  const toggleBookmark = useCallback((articleId: string) =>
+    setBookmarks((prev) => {
+      const exists = prev.find((b) => b.articleId === articleId);
+      return exists ? prev.filter((b) => b.articleId !== articleId) : [...prev, { id: `bm-${Date.now()}`, articleId, savedDate: new Date().toISOString() }];
+    }), []);
+
+  const addChatMessage = useCallback((m: ChatMessage) => setChat((prev) => [...prev, m]), []);
+  const clearChat = useCallback(() => setChat([]), []);
+
+  const updateSettings = useCallback((patch: Partial<AppSettings>) => {
+    setSettings((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.theme) setTheme(patch.theme);
+      return next;
+    });
+  }, []);
+
+  const resetDemoData = useCallback(() => {
+    Object.values(KEYS).forEach((k) => localStorage.removeItem(k));
+    setProfileState(defaultProfile);
+    setMedications(defaultMedications);
+    setDoses(defaultDoses);
+    setRefills(defaultRefills);
+    setReports(defaultReports);
+    setBookmarks([]);
+    setChat([]);
+    setSettings(defaultSettings);
+    setTheme(defaultSettings.theme);
+  }, []);
+
+  const value: DataContextValue = {
+    profile,
+    setProfile,
+    medications,
+    addMedication,
+    updateMedication,
+    deleteMedication,
+    doses,
+    addDose,
+    updateDose,
+    setDoseStatus,
+    refills,
+    addRefill,
+    labs,
+    visits,
+    reports,
+    addReport,
+    bookmarks,
+    toggleBookmark,
+    chat,
+    addChatMessage,
+    clearChat,
+    settings,
+    updateSettings,
+    resetDemoData,
+  };
+
+  return <DataContext.Provider value={value}>{children}</DataContext.Provider>;
+}
+
+export function useData() {
+  const ctx = useContext(DataContext);
+  if (!ctx) throw new Error('useData must be used within DataProvider');
+  return ctx;
+}
+
+export { getTheme };
+
+
+================================================================================
+FILE: src\pages\Medications.tsx
+================================================================================
+import { useState, useMemo } from 'react';
+import {
+  Plus, Search, Edit2, Trash2, Pill, Clock, Package, CalendarDays,
+  FileText, AlertCircle, ScanLine,
+} from 'lucide-react';
+import { useData } from '@/context/DataContext';
+import { Card, PageHeader, Badge, EmptyState, ConfirmDialog } from '@/components/ui';
+import Modal from '@/components/ui/Modal';
+import { useToast } from '@/components/ui/Toast';
+import type { Medication } from '@/types';
+import { uid } from '@/lib/medUtils';
+import { formatDate } from '@/lib/medUtils';
+
+const emptyMed: Omit<Medication, 'id' | 'createdAt'> = {
+  name: '', dosage: '', unit: 'mg', times: ['08:00'], frequency: 'Once daily',
+  duration: '', instructions: '', startDate: '', endDate: '',
+  quantity: 0, quantityPerDose: 1, lowStockThreshold: 10,
+  expiryDate: '', notes: '', pharmacy: '',
+};
+
+export default function Medications() {
+  const { medications, addMedication, updateMedication, deleteMedication } = useData();
+  const notify = useToast();
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('name');
+  const [filterStock, setFilterStock] = useState('all');
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState<Medication | null>(null);
+  const [form, setForm] = useState(emptyMed);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [ocrOpen, setOcrOpen] = useState(false);
+
+  const filtered = useMemo(() => {
+    let list = [...medications];
+    if (search) list = list.filter((m) => m.name.toLowerCase().includes(search.toLowerCase()) || m.instructions.toLowerCase().includes(search.toLowerCase()));
+    if (filterStock === 'low') list = list.filter((m) => m.quantity <= m.lowStockThreshold);
+    if (filterStock === 'ok') list = list.filter((m) => m.quantity > m.lowStockThreshold);
+    list.sort((a, b) => {
+      if (sortBy === 'name') return a.name.localeCompare(b.name);
+      if (sortBy === 'stock') return a.quantity - b.quantity;
+      if (sortBy === 'expiry') return (a.expiryDate || '9999').localeCompare(b.expiryDate || '9999');
+      return 0;
+    });
+    return list;
+  }, [medications, search, sortBy, filterStock]);
+
+  function openAdd() {
+    setEditing(null);
+    setForm(emptyMed);
+    setErrors({});
+    setModalOpen(true);
+  }
+
+  function openEdit(med: Medication) {
+    setEditing(med);
+    setForm({ ...med });
+    setErrors({});
+    setModalOpen(true);
+  }
+
+  function validate(): boolean {
+    const e: Record<string, string> = {};
+    if (!form.name.trim()) e.name = 'Medicine name is required';
+    if (!form.dosage.trim()) e.dosage = 'Dosage is required';
+    if (form.times.length === 0 || form.times.some((t) => !t)) e.times = 'At least one dose time is required';
+    if (form.quantity < 0) e.quantity = 'Quantity cannot be negative';
+    setErrors(e);
+    return Object.keys(e).length === 0;
+  }
+
+  function handleSave() {
+    if (!validate()) return;
+    if (editing) {
+      updateMedication({ ...editing, ...form });
+      notify('Medication updated successfully.', 'success');
+    } else {
+      addMedication({ ...form, id: uid('med-'), createdAt: new Date().toISOString() });
+      notify('Medication added successfully.', 'success');
+    }
+    setModalOpen(false);
+  }
+
+  function handleDelete() {
+    if (deleteId) {
+      deleteMedication(deleteId);
+      notify('Medication deleted.', 'success');
+      setDeleteId(null);
+    }
+  }
+
+  function updateTime(idx: number, value: string) {
+    const times = [...form.times];
+    times[idx] = value;
+    setForm({ ...form, times });
+  }
+  function addTime() { setForm({ ...form, times: [...form.times, ''] }); }
+  function removeTime(idx: number) { setForm({ ...form, times: form.times.filter((_, i) => i !== idx) }); }
+
+  return (
+    <div>
+      <PageHeader
+        title="My Medications"
+        subtitle="Manage your prescribed medicines, doses and instructions. Use only information from your prescription."
+        actions={
+          <>
+            <button onClick={() => setOcrOpen(true)} className="btn btn-outline">
+              <ScanLine className="h-4 w-4" /> OCR Import
+            </button>
+            <button onClick={openAdd} className="btn btn-primary">
+              <Plus className="h-4 w-4" /> Add Medication
+            </button>
+          </>
+        }
+      />
+
+      {/* Search & filters */}
+      <Card className="mb-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+            <input className="input pl-10" placeholder="Search medicines..." value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <select className="input sm:w-40" value={filterStock} onChange={(e) => setFilterStock(e.target.value)}>
+            <option value="all">All stock</option>
+            <option value="low">Low stock</option>
+            <option value="ok">Well stocked</option>
+          </select>
+          <select className="input sm:w-40" value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
+            <option value="name">Sort by name</option>
+            <option value="stock">Sort by stock</option>
+            <option value="expiry">Sort by expiry</option>
+          </select>
+        </div>
+      </Card>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon={<Pill className="h-10 w-10" />} title="No medications found" message="Add your first medication to get started." action={<button onClick={openAdd} className="btn btn-primary"><Plus className="h-4 w-4" /> Add Medication</button>} />
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {filtered.map((med) => (
+            <Card key={med.id}>
+              <div className="mb-3 flex items-start justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary-100 text-primary-600 dark:bg-primary-700/20 dark:text-primary-400">
+                    <Pill className="h-5 w-5" />
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-gray-900 dark:text-white">{med.name}</h3>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">{med.dosage} {med.unit} Â· {med.frequency}</p>
+                  </div>
+                </div>
+                <div className="flex gap-1">
+                  <button onClick={() => openEdit(med)} className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-primary-600 dark:hover:bg-slate-800" aria-label="Edit medication">
+                    <Edit2 className="h-4 w-4" />
+                  </button>
+                  <button onClick={() => setDeleteId(med.id)} className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-error-600 dark:hover:bg-slate-800" aria-label="Delete medication">
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-2 text-sm">
+                <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
+                  <Clock className="h-4 w-4 text-secondary-500" />
+                  {med.times.map((t) => {
+                    const [h, m] = t.split(':');
+                    const hr = parseInt(h, 10);
+                    const ampm = hr >= 12 ? 'PM' : 'AM';
+                    const h12 = hr % 12 || 12;
+                    return <span key={t} className="badge bg-secondary-100 text-secondary-700 dark:bg-secondary-700/30 dark:text-secondary-400">{h12}:{m} {ampm}</span>;
+                  })}
+                </div>
+                {med.instructions && <p className="flex items-start gap-2 text-gray-600 dark:text-gray-400"><FileText className="mt-0.5 h-4 w-4 shrink-0 text-gray-400" />{med.instructions}</p>}
+                <div className="flex items-center gap-2">
+                  <Package className="h-4 w-4 text-warning-500" />
+                  <span className="text-gray-600 dark:text-gray-400">{med.quantity} {med.unit} in stock</span>
+                  {med.quantity <= med.lowStockThreshold && <Badge variant="error">Low</Badge>}
+                </div>
+                {med.expiryDate && (
+                  <div className="flex items-center gap-2 text-gray-600 dark:text-gray-400">
+                    <CalendarDays className="h-4 w-4 text-gray-400" />
+                    Expires {formatDate(med.expiryDate)}
+                  </div>
+                )}
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {/* Add/Edit Modal */}
+      <Modal
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        title={editing ? 'Edit Medication' : 'Add Medication'}
+        size="lg"
+        footer={
+          <>
+            <button onClick={() => setModalOpen(false)} className="btn btn-outline">Cancel</button>
+            <button onClick={handleSave} className="btn btn-primary">{editing ? 'Save Changes' : 'Add Medication'}</button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div className="rounded-xl bg-warning-50 p-3 text-xs text-warning-700 dark:bg-warning-700/10 dark:text-warning-400">
+            <AlertCircle className="mb-1 inline h-4 w-4" /> Enter details exactly as prescribed. This app does not prescribe or recommend dose changes.
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="label">Medicine Name *</label>
+              <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g., Metformin" />
+              {errors.name && <p className="mt-1 text-xs text-error-500">{errors.name}</p>}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="label">Dosage *</label>
+                <input className="input" value={form.dosage} onChange={(e) => setForm({ ...form, dosage: e.target.value })} placeholder="500" />
+                {errors.dosage && <p className="mt-1 text-xs text-error-500">{errors.dosage}</p>}
+              </div>
+              <div>
+                <label className="label">Unit</label>
+                <select className="input" value={form.unit} onChange={(e) => setForm({ ...form, unit: e.target.value })}>
+                  <option>mg</option><option>ml</option><option>tablets</option><option>capsules</option><option>drops</option><option>units</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="label">Frequency</label>
+              <input className="input" value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })} placeholder="e.g., Twice daily" />
+            </div>
+            <div>
+              <label className="label">Duration</label>
+              <input className="input" value={form.duration} onChange={(e) => setForm({ ...form, duration: e.target.value })} placeholder="e.g., 30 days / Ongoing" />
+            </div>
+          </div>
+          <div>
+            <div className="mb-1 flex items-center justify-between">
+              <label className="label mb-0">Scheduled Dose Times *</label>
+              <button onClick={addTime} className="text-xs font-medium text-primary-600 hover:underline dark:text-primary-400">+ Add time</button>
+            </div>
+            <div className="space-y-2">
+              {form.times.map((t, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <input type="time" className="input flex-1" value={t} onChange={(e) => updateTime(i, e.target.value)} />
+                  {form.times.length > 1 && <button onClick={() => removeTime(i)} className="rounded-lg p-2 text-gray-400 hover:text-error-500" aria-label="Remove time"><Trash2 className="h-4 w-4" /></button>}
+                </div>
+              ))}
+            </div>
+            {errors.times && <p className="mt-1 text-xs text-error-500">{errors.times}</p>}
+          </div>
+          <div>
+            <label className="label">Prescription Instructions</label>
+            <textarea className="input" rows={2} value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })} placeholder="e.g., Take after meals with water" />
+          </div>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <div>
+              <label className="label">Quantity in Stock</label>
+              <input type="number" min={0} className="input" value={form.quantity} onChange={(e) => setForm({ ...form, quantity: parseInt(e.target.value) || 0 })} />
+              {errors.quantity && <p className="mt-1 text-xs text-error-500">{errors.quantity}</p>}
+            </div>
+            <div>
+              <label className="label">Per-Dose Quantity</label>
+              <input type="number" min={0} className="input" value={form.quantityPerDose} onChange={(e) => setForm({ ...form, quantityPerDose: parseInt(e.target.value) || 1 })} />
+            </div>
+            <div>
+              <label className="label">Low-Stock Threshold</label>
+              <input type="number" min={0} className="input" value={form.lowStockThreshold} onChange={(e) => setForm({ ...form, lowStockThreshold: parseInt(e.target.value) || 0 })} />
+            </div>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="label">Start Date</label>
+              <input type="date" className="input" value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} />
+            </div>
+            <div>
+              <label className="label">End Date (optional)</label>
+              <input type="date" className="input" value={form.endDate} onChange={(e) => setForm({ ...form, endDate: e.target.value })} />
+            </div>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label className="label">Expiry Date (optional)</label>
+              <input type="date" className="input" value={form.expiryDate} onChange={(e) => setForm({ ...form, expiryDate: e.target.value })} />
+            </div>
+            <div>
+              <label className="label">Pharmacy / Supplier</label>
+              <input className="input" value={form.pharmacy} onChange={(e) => setForm({ ...form, pharmacy: e.target.value })} placeholder="e.g., Apollo Pharmacy" />
+            </div>
+          </div>
+          <div>
+            <label className="label">Notes (optional)</label>
+            <textarea className="input" rows={2} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+          </div>
+        </div>
+      </Modal>
+
+      {/* OCR Modal */}
+      <Modal open={ocrOpen} onClose={() => setOcrOpen(false)} title="OCR Import (Optional)" size="lg"
+        footer={<>
+          <button onClick={() => setOcrOpen(false)} className="btn btn-outline">Close</button>
+          <button onClick={() => { setOcrOpen(false); openAdd(); }} className="btn btn-primary">Use Extracted Data</button>
+        </>}
+      >
+        <OcrImport onExtract={(text) => {
+          setForm({ ...emptyMed, name: text.split('\n')[0]?.slice(0, 50) || '', instructions: text.slice(0, 200) });
+        }} />
+      </Modal>
+
+      <ConfirmDialog
+        open={!!deleteId}
+        onClose={() => setDeleteId(null)}
+        onConfirm={handleDelete}
+        title="Delete Medication?"
+        message="This will remove the medication and its dose records. This action cannot be undone."
+        confirmLabel="Delete"
+        danger
+      />
+    </div>
+  );
+}
+
+function OcrImport({ onExtract }: { onExtract: (text: string) => void }) {
+  const [image, setImage] = useState<string | null>(null);
+  const [extracted, setExtracted] = useState('');
+  const [processing, setProcessing] = useState(false);
+  const [error, setError] = useState('');
+  const notify = useToast();
+
+  async function handleFile(file: File) {
+    setError('');
+    setExtracted('');
+    const reader = new FileReader();
+    reader.onload = () => setImage(reader.result as string);
+    reader.readAsDataURL(file);
+  }
+
+  async function runOcr() {
+    if (!image) return;
+    setProcessing(true);
+    setError('');
+    try {
+      const { default: Tesseract } = await import('tesseract.js');
+      const result = await Tesseract.recognize(image, 'eng');
+      setExtracted(result.data.text);
+      onExtract(result.data.text);
+      notify('OCR extraction complete. Please review the text carefully.', 'success');
+    } catch {
+      setError('OCR processing failed. You can still enter medication details manually.');
+      notify('OCR failed. Please enter details manually.', 'error');
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-xl bg-warning-50 p-3 text-xs text-warning-700 dark:bg-warning-700/10 dark:text-warning-400">
+        <AlertCircle className="mb-1 inline h-4 w-4" /> OCR may misread medicine names, strengths and instructions. Always verify extracted text against your original prescription before saving.
+      </div>
+      <div>
+        <label className="label">Upload prescription or medicine label image</label>
+        <input type="file" accept="image/*" className="input" onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])} />
+      </div>
+      {image && (
+        <div>
+          <img src={image} alt="Uploaded" className="max-h-48 rounded-xl border border-gray-200 dark:border-slate-700" />
+          <button onClick={runOcr} disabled={processing} className="btn btn-primary mt-3">
+            <ScanLine className="h-4 w-4" /> {processing ? 'Processing...' : 'Extract Text'}
+          </button>
+        </div>
+      )}
+      {error && <p className="text-sm text-error-500">{error}</p>}
+      {extracted && (
+        <div>
+          <label className="label">Extracted Text (review and correct)</label>
+          <textarea className="input" rows={6} value={extracted} onChange={(e) => { setExtracted(e.target.value); onExtract(e.target.value); }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+================================================================================
+FILE: src\pages\DoseReminders.tsx
+================================================================================
+import { useState, useMemo, useEffect } from 'react';
+import {
+  CheckCircle2, XCircle, Clock, AlertTriangle, Bell, BellOff,
+  Calendar, TrendingUp, Pill, RefreshCw, Info,
+} from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, PieChart, Pie, Cell, Legend } from 'recharts';
+import { useData } from '@/context/DataContext';
+import { Card, PageHeader, Badge, EmptyState, SectionTitle } from '@/components/ui';
+import { useToast } from '@/components/ui/Toast';
+import {
+  ensureTodayDoses, getDosesForDate, getAdherenceStats, formatTime, formatDate, todayISO,
+} from '@/lib/medUtils';
+import type { DoseStatus } from '@/types';
+import { requestNotificationPermission, showBrowserNotification } from '@/lib/offline';
+
+const statusConfig: Record<DoseStatus, { label: string; icon: typeof Clock; variant: 'neutral' | 'success' | 'warning' | 'error' | 'info' }> = {
+  scheduled: { label: 'Scheduled', icon: Clock, variant: 'info' },
+  taken: { label: 'Taken', icon: CheckCircle2, variant: 'success' },
+  skipped: { label: 'Skipped', icon: XCircle, variant: 'neutral' },
+  not_confirmed: { label: 'Not Confirmed', icon: AlertTriangle, variant: 'warning' },
+  missed: { label: 'Missed', icon: XCircle, variant: 'error' },
+};
+
+export default function DoseReminders() {
+  const { doses, medications, setDoseStatus, settings, updateSettings } = useData();
+  const notify = useToast();
+  const allDoses = ensureTodayDoses(doses, medications);
+  const [selectedDate, setSelectedDate] = useState(todayISO());
+  const dayDoses = getDosesForDate(allDoses, medications, selectedDate);
+  const adherence = getAdherenceStats(allDoses);
+  const [snoozed, setSnoozed] = useState<Record<string, number>>({});
+
+  // Check for due reminders
+  useEffect(() => {
+    if (!settings.reminderEnabled) return;
+    const check = () => {
+      const now = new Date();
+      const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      dayDoses.forEach((d) => {
+        if (d.status === 'scheduled' && d.scheduledTime <= currentTime && !snoozed[d.id]) {
+          showBrowserNotification('MediCare AI Reminder', `Time to take ${d.medicationName} (${d.dosage})`);
+        }
+      });
+    };
+    check();
+    const interval = setInterval(check, 60000);
+    return () => clearInterval(interval);
+  }, [dayDoses, settings.reminderEnabled, snoozed]);
+
+  // Auto-mark missed doses (past days that remained scheduled)
+  useEffect(() => {
+    allDoses.forEach((d) => {
+      if (d.status === 'scheduled' && d.scheduledDate < todayISO()) {
+        setDoseStatus(d.id, 'missed');
+      }
+    });
+  }, [allDoses, setDoseStatus]);
+
+  const chartData = useMemo(() => {
+    const last7: { date: string; taken: number; missed: number; skipped: number }[] = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = todayISO(-i);
+      const dayD = allDoses.filter((x) => x.scheduledDate === d);
+      last7.push({
+        date: new Date(d + 'T00:00:00').toLocaleDateString(undefined, { weekday: 'short' }),
+        taken: dayD.filter((x) => x.status === 'taken').length,
+        missed: dayD.filter((x) => x.status === 'missed').length,
+        skipped: dayD.filter((x) => x.status === 'skipped').length,
+      });
+    }
+    return last7;
+  }, [allDoses]);
+
+  const pieData = [
+    { name: 'Taken', value: adherence.taken, color: '#16a34a' },
+    { name: 'Skipped', value: adherence.skipped, color: '#9ca3af' },
+    { name: 'Missed', value: adherence.missed, color: '#dc2626' },
+  ].filter((d) => d.value > 0);
+
+  async function enableNotifications() {
+    const perm = await requestNotificationPermission();
+    if (perm === 'granted') {
+      updateSettings({ notificationsEnabled: true });
+      notify('Browser notifications enabled.', 'success');
+    } else {
+      notify('Notification permission denied. In-app reminders remain available.', 'warning');
+    }
+  }
+
+  function handleSnooze(doseId: string) {
+    setSnoozed({ ...snoozed, [doseId]: Date.now() + settings.snoozeMinutes * 60000 });
+    notify(`Reminder snoozed for ${settings.snoozeMinutes} minutes.`, 'info');
+  }
+
+  function handleStatus(doseId: string, status: DoseStatus) {
+    setDoseStatus(doseId, status);
+    notify(`Dose marked as ${statusConfig[status].label.toLowerCase()}.`, 'success');
+  }
+
+  return (
+    <div>
+      <PageHeader
+        title="Dose Reminders & Adherence"
+        subtitle="Track your daily medication schedule and view your adherence statistics."
+        actions={
+          settings.notificationsEnabled ? (
+            <Badge variant="success"><Bell className="h-3 w-3" /> Notifications On</Badge>
+          ) : (
+            <button onClick={enableNotifications} className="btn btn-outline">
+              <Bell className="h-4 w-4" /> Enable Notifications
+            </button>
+          )
+        }
+      />
+
+      {/* Limitations notice */}
+      <div className="mb-6 flex items-start gap-2 rounded-xl bg-secondary-50 p-3 text-xs text-secondary-700 dark:bg-secondary-700/10 dark:text-secondary-400">
+        <Info className="mt-0.5 h-4 w-4 shrink-0" />
+        <p>Browser notifications and reminders may not run reliably when the app is closed, the browser is suspended, or the device restricts background activity. Keep the app open for reminders to work.</p>
+      </div>
+
+      {/* Adherence stats */}
+      <div className="grid gap-4 lg:grid-cols-4">
+        <StatBox label="Adherence Rate" value={`${adherence.rate}%`} icon={<TrendingUp className="h-5 w-5" />} color="text-primary-600" />
+        <StatBox label="Doses Taken" value={adherence.taken} icon={<CheckCircle2 className="h-5 w-5" />} color="text-success-500" />
+        <StatBox label="Doses Missed" value={adherence.missed} icon={<XCircle className="h-5 w-5" />} color="text-error-500" />
+        <StatBox label="Doses Skipped" value={adherence.skipped} icon={<AlertTriangle className="h-5 w-5" />} color="text-gray-400" />
+      </div>
+
+      {/* Charts */}
+      <div className="mt-6 grid gap-6 lg:grid-cols-2">
+        <Card>
+          <SectionTitle className="mb-4">Last 7 Days Adherence</SectionTitle>
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={chartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" className="dark:opacity-20" />
+              <XAxis dataKey="date" tick={{ fontSize: 12 }} />
+              <YAxis tick={{ fontSize: 12 }} allowDecimals={false} />
+              <Tooltip contentStyle={{ borderRadius: 12, fontSize: 12 }} />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Bar dataKey="taken" stackId="a" fill="#16a34a" name="Taken" />
+              <Bar dataKey="skipped" stackId="a" fill="#9ca3af" name="Skipped" />
+              <Bar dataKey="missed" stackId="a" fill="#dc2626" name="Missed" />
+            </BarChart>
+          </ResponsiveContainer>
+        </Card>
+        <Card>
+          <SectionTitle className="mb-4">Overall Distribution</SectionTitle>
+          {pieData.length === 0 ? (
+            <EmptyState title="No data yet" message="Record doses to see distribution." />
+          ) : (
+            <ResponsiveContainer width="100%" height={240}>
+              <PieChart>
+                <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={80} label>
+                  {pieData.map((d) => <Cell key={d.name} fill={d.color} />)}
+                </Pie>
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Tooltip />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </Card>
+      </div>
+
+      {/* Date selector */}
+      <Card className="mt-6">
+        <div className="flex items-center justify-between">
+          <SectionTitle>Dose Timeline</SectionTitle>
+          <div className="flex items-center gap-2">
+            <Calendar className="h-4 w-4 text-gray-400" />
+            <input type="date" className="input w-auto" value={selectedDate} max={todayISO()} onChange={(e) => setSelectedDate(e.target.value)} />
+          </div>
+        </div>
+        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{formatDate(selectedDate)}</p>
+
+        {dayDoses.length === 0 ? (
+          <div className="mt-4">
+            <EmptyState icon={<Pill className="h-8 w-8" />} title="No doses scheduled" message="Add a medication to see scheduled doses here." />
+          </div>
+        ) : (
+          <div className="mt-4 space-y-3">
+            {dayDoses.map((dose) => {
+              const cfg = statusConfig[dose.status];
+              const StatusIcon = cfg.icon;
+              return (
+                <div key={dose.id} className="flex flex-col gap-3 rounded-xl border border-gray-100 p-4 dark:border-slate-800 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gray-100 dark:bg-slate-800">
+                      <StatusIcon className={`h-5 w-5 ${cfg.variant === 'success' ? 'text-success-500' : cfg.variant === 'error' ? 'text-error-500' : cfg.variant === 'warning' ? 'text-warning-500' : 'text-gray-400'}`} />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <p className="font-medium text-gray-900 dark:text-white">{dose.medicationName}</p>
+                        <Badge variant={cfg.variant}>{cfg.label}</Badge>
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{dose.dosage} Â· {formatTime(dose.scheduledTime)}{dose.confirmedAt ? ` Â· Confirmed ${new Date(dose.confirmedAt).toLocaleTimeString()}` : ''}</p>
+                    </div>
+                  </div>
+                  {dose.status === 'scheduled' && (
+                    <div className="flex flex-wrap gap-2">
+                      <button onClick={() => handleStatus(dose.id, 'taken')} className="btn btn-primary btn-sm"><CheckCircle2 className="h-3 w-3" /> Taken</button>
+                      <button onClick={() => handleStatus(dose.id, 'skipped')} className="btn btn-outline btn-sm"><XCircle className="h-3 w-3" /> Skip</button>
+                      <button onClick={() => handleSnooze(dose.id)} className="btn btn-ghost btn-sm"><RefreshCw className="h-3 w-3" /> Snooze</button>
+                    </div>
+                  )}
+                  {dose.status !== 'scheduled' && (
+                    <button onClick={() => handleStatus(dose.id, 'scheduled')} className="btn btn-ghost btn-sm">Reset</button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
+      {/* Reminder prefs */}
+      <Card className="mt-6">
+        <SectionTitle className="mb-3">Reminder Preferences</SectionTitle>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <div>
+            <label className="label">Reminders</label>
+            <button onClick={() => updateSettings({ reminderEnabled: !settings.reminderEnabled })} className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-sm ${settings.reminderEnabled ? 'border-success-200 bg-success-50 text-success-700 dark:border-success-700/50 dark:bg-success-700/10 dark:text-success-400' : 'border-gray-200 text-gray-600 dark:border-slate-700 dark:text-gray-400'}`}>
+              {settings.reminderEnabled ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
+              {settings.reminderEnabled ? 'Enabled' : 'Disabled'}
+            </button>
+          </div>
+          <div>
+            <label className="label">Lead Time (minutes)</label>
+            <input type="number" min={0} max={60} className="input" value={settings.reminderLeadMinutes} onChange={(e) => updateSettings({ reminderLeadMinutes: parseInt(e.target.value) || 0 })} />
+          </div>
+          <div>
+            <label className="label">Snooze (minutes)</label>
+            <input type="number" min={1} max={60} className="input" value={settings.snoozeMinutes} onChange={(e) => updateSettings({ snoozeMinutes: parseInt(e.target.value) || 10 })} />
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function StatBox({ label, value, icon, color }: { label: string; value: string | number; icon: React.ReactNode; color: string }) {
+  return (
+    <Card className="flex items-center gap-3">
+      <div className={`${color}`}>{icon}</div>
+      <div>
+        <p className="text-xs text-gray-500 dark:text-gray-400">{label}</p>
+        <p className="text-xl font-bold text-gray-900 dark:text-white">{value}</p>
+      </div>
+    </Card>
+  );
+}
+
+
+================================================================================
+FILE: src\pages\CameraMonitoring.tsx
+================================================================================
+import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  Camera, CameraOff, Play, Square, Video, VideoOff, AlertCircle,
+  CheckCircle2, XCircle, Hand, Activity, Info, ShieldCheck, RefreshCw,
+} from 'lucide-react';
+import { useData } from '@/context/DataContext';
+import { Card, PageHeader, Badge, EmptyState, SectionTitle } from '@/components/ui';
+import Modal from '@/components/ui/Modal';
+import { useToast } from '@/components/ui/Toast';
+import {
+  ensureTodayDoses, getTodayDoses, formatTime, todayISO,
+} from '@/lib/medUtils';
+import type { DoseRecord, MonitoringStatus } from '@/types';
+
+type CamState = 'idle' | 'requesting' | 'active' | 'denied' | 'error';
+
+export default function CameraMonitoring() {
+  const { medications, doses, updateDose, settings, updateSettings } = useData();
+  const notify = useToast();
+  const allDoses = ensureTodayDoses(doses, medications);
+  const todayDoses = getTodayDoses(allDoses, medications);
+  const eligibleDoses = todayDoses.filter((d) => d.status === 'scheduled');
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const motionCanvasRef = useRef<HTMLCanvasElement>(null);
+  const motionTimerRef = useRef<number | null>(null);
+  const prevFrameRef = useRef<ImageData | null>(null);
+
+  const [camState, setCamState] = useState<CamState>('idle');
+  const [activeDoseId, setActiveDoseId] = useState<string | null>(null);
+  const [monitoringStatus, setMonitoringStatus] = useState<MonitoringStatus>('scheduled');
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [demoMode, setDemoMode] = useState(false);
+  const [motionScore, setMotionScore] = useState(0);
+
+  const activeDose = todayDoses.find((d) => d.id === activeDoseId);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) videoRef.current.srcObject = null;
+    if (motionTimerRef.current) {
+      clearInterval(motionTimerRef.current);
+      motionTimerRef.current = null;
+    }
+    prevFrameRef.current = null;
+    setCamState('idle');
+    setMonitoringStatus('scheduled');
+    setMotionScore(0);
+  }, []);
+
+  useEffect(() => {
+    return () => stopCamera();
+  }, [stopCamera]);
+
+  async function startCamera() {
+    setCamState('requesting');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCamState('active');
+      setDemoMode(false);
+      notify('Camera started. Monitoring is ready.', 'success');
+    } catch (err) {
+      const e = err as Error;
+      if (e.name === 'NotAllowedError') {
+        setCamState('denied');
+        notify('Camera permission denied. Use Demo Mode or manual tracking.', 'warning');
+      } else {
+        setCamState('error');
+        notify('Camera could not be started. ' + e.message, 'error');
+      }
+    }
+  }
+
+  function startMonitoring(doseId: string) {
+    if (demoMode || camState !== 'active') {
+      setDemoMode(true);
+      setActiveDoseId(doseId);
+      setMonitoringStatus('monitoring');
+      notify('Demonstration Mode active. This simulates motion detection.', 'info');
+      runDemoSimulation();
+      return;
+    }
+    setActiveDoseId(doseId);
+    setMonitoringStatus('monitoring');
+    updateDose(doseId, { monitoringStatus: 'monitoring' });
+    startMotionDetection(doseId);
+  }
+
+  function startMotionDetection(doseId: string) {
+    setMonitoringStatus('waiting');
+    updateDose(doseId, { monitoringStatus: 'waiting' });
+    if (motionTimerRef.current) clearInterval(motionTimerRef.current);
+
+    motionTimerRef.current = window.setInterval(() => {
+      const video = videoRef.current;
+      const canvas = motionCanvasRef.current;
+      if (!video || !canvas || video.readyState !== 4) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      canvas.width = 160;
+      canvas.height = 120;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const current = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      if (prevFrameRef.current) {
+        let diff = 0;
+        const data = current.data;
+        const prev = prevFrameRef.current.data;
+        for (let i = 0; i < data.length; i += 4) {
+          diff += Math.abs(data[i] - prev[i]) + Math.abs(data[i + 1] - prev[i + 1]) + Math.abs(data[i + 2] - prev[i + 2]);
+        }
+        const normalized = diff / (data.length / 4) / 765;
+        setMotionScore(normalized);
+        if (normalized > 0.06 && monitoringStatus === 'waiting') {
+          setMonitoringStatus('movement_detected');
+          updateDose(doseId, { monitoringStatus: 'movement_detected' });
+          setShowConfirm(true);
+          if (motionTimerRef.current) clearInterval(motionTimerRef.current);
+        }
+      }
+      prevFrameRef.current = current;
+    }, 500);
+  }
+
+  function runDemoSimulation() {
+    setMonitoringStatus('waiting');
+    setTimeout(() => {
+      setMonitoringStatus('movement_detected');
+      if (activeDoseId) updateDose(activeDoseId, { monitoringStatus: 'movement_detected' });
+      setShowConfirm(true);
+    }, 3500);
+  }
+
+  function confirmTaken() {
+    if (activeDoseId) {
+      updateDose(activeDoseId, { status: 'taken', monitoringStatus: 'confirmed', source: demoMode ? 'simulated' : 'camera', confirmedAt: new Date().toISOString() });
+      notify('Dose confirmed as taken.', 'success');
+    }
+    setShowConfirm(false);
+    setActiveDoseId(null);
+    setMonitoringStatus('scheduled');
+  }
+
+  function confirmNotTaken() {
+    if (activeDoseId) {
+      updateDose(activeDoseId, { status: 'not_confirmed', monitoringStatus: 'not_confirmed', source: demoMode ? 'simulated' : 'camera' });
+      notify('Dose marked as not taken. No dose doubling is advised.', 'info');
+    }
+    setShowConfirm(false);
+    setActiveDoseId(null);
+    setMonitoringStatus('scheduled');
+  }
+
+  const monitoringSessions = allDoses.filter((d) => d.source === 'camera' || d.source === 'simulated' || d.monitoringStatus !== 'scheduled').slice(-8).reverse();
+
+  const statusInfo: Record<MonitoringStatus, { label: string; color: string }> = {
+    scheduled: { label: 'Scheduled', color: 'text-gray-500' },
+    monitoring: { label: 'Monitoring in Progress', color: 'text-secondary-500' },
+    waiting: { label: 'Waiting for Movement', color: 'text-warning-500' },
+    movement_detected: { label: 'Movement Detected', color: 'text-primary-500' },
+    review: { label: 'Review Required', color: 'text-warning-500' },
+    confirmed: { label: 'Patient Confirmed', color: 'text-success-500' },
+    not_confirmed: { label: 'Not Confirmed', color: 'text-warning-500' },
+    missed: { label: 'Missed Dose', color: 'text-error-500' },
+  };
+
+  return (
+    <div>
+      <PageHeader
+        title="Camera-Assisted Dose Monitoring"
+        subtitle="Detects possible medication-taking movement. Movement is never proof of ingestion â€” your confirmation is always required."
+      />
+
+      {/* Safety notices */}
+      <div className="mb-6 grid gap-3 sm:grid-cols-2">
+        <div className="flex items-start gap-2 rounded-xl bg-secondary-50 p-3 text-xs text-secondary-700 dark:bg-secondary-700/10 dark:text-secondary-400">
+          <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+          <p>Camera frames are processed locally in your browser. No video is recorded, uploaded, or retained. Camera stops automatically when you leave this page.</p>
+        </div>
+        <div className="flex items-start gap-2 rounded-xl bg-warning-50 p-3 text-xs text-warning-700 dark:bg-warning-700/10 dark:text-warning-400">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <p>Motion detection cannot prove a medicine was swallowed. Lighting, camera angle, and other movements can affect accuracy. Always confirm manually.</p>
+        </div>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-2">
+        {/* Camera preview */}
+        <Card>
+          <div className="mb-3 flex items-center justify-between">
+            <SectionTitle>Camera Preview</SectionTitle>
+            {camState === 'active' && (
+              <Badge variant="error"><span className="h-2 w-2 animate-pulse rounded-full bg-error-500" /> Camera Active</Badge>
+            )}
+          </div>
+          <div className="relative overflow-hidden rounded-xl bg-black aspect-video">
+            <video ref={videoRef} className="h-full w-full object-cover" playsInline muted />
+            <canvas ref={motionCanvasRef} className="hidden" />
+            {camState !== 'active' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-400">
+                <VideoOff className="h-12 w-12" />
+                <p className="mt-2 text-sm">Camera is off</p>
+              </div>
+            )}
+            {camState === 'active' && monitoringStatus !== 'scheduled' && (
+              <div className="absolute bottom-3 left-3 rounded-lg bg-black/60 px-3 py-1.5 text-xs text-white">
+                <Activity className="mr-1 inline h-3 w-3" />
+                {statusInfo[monitoringStatus].label} {motionScore > 0 && `Â· Motion: ${(motionScore * 100).toFixed(1)}%`}
+              </div>
+            )}
+          </div>
+
+          <div className="mt-4 flex flex-wrap gap-2">
+            {camState === 'idle' || camState === 'denied' || camState === 'error' ? (
+              <button onClick={startCamera} className="btn btn-primary">
+                <Camera className="h-4 w-4" /> Request Camera Permission
+              </button>
+            ) : (
+              <button onClick={stopCamera} className="btn btn-danger">
+                <CameraOff className="h-4 w-4" /> Stop Camera
+              </button>
+            )}
+            <button onClick={() => { setDemoMode(true); setCamState('idle'); notify('Demonstration Mode enabled.', 'info'); }} className={`btn ${demoMode ? 'btn-secondary' : 'btn-outline'}`}>
+              <Play className="h-4 w-4" /> Demo Mode
+            </button>
+          </div>
+
+          {camState === 'denied' && (
+            <div className="mt-3 rounded-xl bg-error-50 p-3 text-sm text-error-700 dark:bg-error-700/10 dark:text-error-400">
+              Camera permission was denied. You can use Demonstration Mode or manual dose tracking instead.
+            </div>
+          )}
+          {camState === 'error' && (
+            <div className="mt-3 rounded-xl bg-error-50 p-3 text-sm text-error-700 dark:bg-error-700/10 dark:text-error-400">
+              Camera is not available on this device or browser. Use Demo Mode or manual tracking.
+            </div>
+          )}
+          {demoMode && (
+            <div className="mt-3 flex items-start gap-2 rounded-xl bg-secondary-50 p-3 text-xs text-secondary-700 dark:bg-secondary-700/10 dark:text-secondary-400">
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              Demonstration Mode is active. Results are simulated for demonstration â€” no real camera analysis is occurring.
+            </div>
+          )}
+        </Card>
+
+        {/* Eligible doses */}
+        <Card>
+          <SectionTitle className="mb-3">Eligible Scheduled Doses</SectionTitle>
+          {eligibleDoses.length === 0 ? (
+            <EmptyState icon={<CheckCircle2 className="h-8 w-8" />} title="No eligible doses" message="All today's doses are already confirmed or there are no scheduled doses." />
+          ) : (
+            <div className="space-y-2">
+              {eligibleDoses.map((dose) => (
+                <div key={dose.id} className="flex items-center justify-between rounded-xl border border-gray-100 p-3 dark:border-slate-800">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary-100 text-primary-600 dark:bg-primary-700/20 dark:text-primary-400">
+                      <Hand className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-900 dark:text-white">{dose.medicationName}</p>
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{dose.dosage} Â· {formatTime(dose.scheduledTime)}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => startMonitoring(dose.id)}
+                    disabled={camState === 'requesting'}
+                    className="btn btn-primary btn-sm"
+                  >
+                    <Play className="h-3 w-3" /> Start
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-4">
+            <label className="label">Monitoring Window (minutes)</label>
+            <input type="number" min={1} max={60} className="input w-32" value={settings.monitoringWindowMinutes} onChange={(e) => updateSettings({ monitoringWindowMinutes: parseInt(e.target.value) || 10 })} />
+          </div>
+        </Card>
+      </div>
+
+      {/* Monitoring history */}
+      <Card className="mt-6">
+        <SectionTitle className="mb-3">Camera Monitoring History</SectionTitle>
+        {monitoringSessions.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">No monitoring sessions recorded yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700">
+                  <th className="pb-2 pr-4 font-medium">Date</th>
+                  <th className="pb-2 pr-4 font-medium">Medicine</th>
+                  <th className="pb-2 pr-4 font-medium">Monitoring</th>
+                  <th className="pb-2 pr-4 font-medium">Confirmation</th>
+                  <th className="pb-2 font-medium">Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monitoringSessions.map((d: DoseRecord) => (
+                  <tr key={d.id} className="border-b border-gray-100 dark:border-slate-800">
+                    <td className="py-2 pr-4 text-gray-600 dark:text-gray-400">{d.scheduledDate}</td>
+                    <td className="py-2 pr-4 text-gray-900 dark:text-white">{d.medicationName}</td>
+                    <td className="py-2 pr-4"><span className={statusInfo[d.monitoringStatus].color}>{statusInfo[d.monitoringStatus].label}</span></td>
+                    <td className="py-2 pr-4">{d.status.replace('_', ' ')}</td>
+                    <td className="py-2"><Badge variant={d.source === 'camera' ? 'primary' : d.source === 'simulated' ? 'info' : 'neutral'}>{d.source}</Badge></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+
+      {/* Confirmation dialog */}
+      <Modal open={showConfirm} onClose={() => setShowConfirm(false)} title="Possible Medication Intake Detected" size="md"
+        footer={<>
+          <button onClick={() => setShowConfirm(false)} className="btn btn-outline">Review Later</button>
+          <button onClick={confirmNotTaken} className="btn btn-ghost"><XCircle className="h-4 w-4" /> Not Taken</button>
+          <button onClick={confirmTaken} className="btn btn-primary"><CheckCircle2 className="h-4 w-4" /> Confirm Taken</button>
+        </>}
+      >
+        <div className="space-y-4">
+          <div className="flex items-center gap-3 rounded-xl bg-primary-50 p-4 dark:bg-primary-700/10">
+            <Hand className="h-8 w-8 text-primary-500" />
+            <div>
+              <p className="font-semibold text-gray-900 dark:text-white">Possible Medication Intake Detected</p>
+              {activeDose && <p className="text-sm text-gray-600 dark:text-gray-400">{activeDose.medicationName} Â· {activeDose.dosage} Â· {formatTime(activeDose.scheduledTime)}</p>}
+            </div>
+          </div>
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            Movement was detected during the monitoring window. This does not prove the medicine was taken. Please confirm whether you took this dose.
+          </p>
+          <div className="rounded-xl bg-warning-50 p-3 text-xs text-warning-700 dark:bg-warning-700/10 dark:text-warning-400">
+            <AlertCircle className="mb-1 inline h-4 w-4" /> Do not double a dose if you are unsure. Contact your doctor if you missed a dose.
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+
+================================================================================
+FILE: src\pages\Dashboard.tsx
+================================================================================
+import { Link } from 'react-router-dom';
+import {
+  Pill, Bell, Camera, Package, FileText, BookOpen, Siren, Shield,
+  Plus, CheckCircle2, XCircle, Clock, AlertTriangle, TrendingUp,
+  Calendar, Activity, RefreshCw, FolderHeart,
+} from 'lucide-react';
+import { useData } from '@/context/DataContext';
+import { Card, PageHeader, StatCard, SectionTitle, EmptyState, Badge } from '@/components/ui';
+import {
+  getTodayDoses, getAdherenceStats, getRefillAlerts, formatTime, formatDate,
+  ensureTodayDoses, todayISO,
+} from '@/lib/medUtils';
+
+const quickActions = [
+  { label: 'Add Medication', icon: Plus, path: '/medications', color: 'bg-primary-50 text-primary-600 dark:bg-primary-700/20 dark:text-primary-400' },
+  { label: "Today's Schedule", icon: Calendar, path: '/reminders', color: 'bg-secondary-50 text-secondary-600 dark:bg-secondary-700/20 dark:text-secondary-400' },
+  { label: 'Start Camera Monitoring', icon: Camera, path: '/camera-monitoring', color: 'bg-accent-50 text-accent-600 dark:bg-accent-700/20 dark:text-accent-400' },
+  { label: 'Update Stock', icon: Package, path: '/inventory', color: 'bg-warning-50 text-warning-600 dark:bg-warning-700/20 dark:text-warning-400' },
+  { label: 'Generate Report', icon: FileText, path: '/reports', color: 'bg-secondary-50 text-secondary-600 dark:bg-secondary-700/20 dark:text-secondary-400' },
+  { label: 'Open Library', icon: BookOpen, path: '/library', color: 'bg-primary-50 text-primary-600 dark:bg-primary-700/20 dark:text-primary-400' },
+  { label: 'Patient File', icon: FolderHeart, path: '/patient-file', color: 'bg-accent-50 text-accent-600 dark:bg-accent-700/20 dark:text-accent-400' },
+  { label: 'Emergency Guide', icon: Shield, path: '/emergency-guide', color: 'bg-error-50 text-error-600 dark:bg-error-700/20 dark:text-error-400' },
+  { label: 'Emergency Info', icon: Siren, path: '/emergency', color: 'bg-error-50 text-error-600 dark:bg-error-700/20 dark:text-error-400' },
+];
+
+const statusConfig = {
+  scheduled: { label: 'Scheduled', icon: Clock, color: 'text-gray-500' },
+  taken: { label: 'Taken', icon: CheckCircle2, color: 'text-success-500' },
+  skipped: { label: 'Skipped', icon: XCircle, color: 'text-gray-400' },
+  not_confirmed: { label: 'Not Confirmed', icon: AlertTriangle, color: 'text-warning-500' },
+  missed: { label: 'Missed', icon: XCircle, color: 'text-error-500' },
+};
+
+export default function Dashboard() {
+  const { profile, medications, doses, reports } = useData();
+  const allDoses = ensureTodayDoses(doses, medications);
+  const todayDoses = getTodayDoses(allDoses, medications);
+  const adherence = getAdherenceStats(allDoses);
+  const refillAlerts = getRefillAlerts(medications);
+  const lowStock = medications.filter((m) => m.quantity <= m.lowStockThreshold);
+  const upcoming = todayDoses.filter((d) => d.status === 'scheduled');
+  const completed = todayDoses.filter((d) => d.status === 'taken');
+  const missed = todayDoses.filter((d) => d.status === 'missed');
+  const recentReports = reports.slice(0, 3);
+
+  return (
+    <div>
+      <PageHeader
+        title={`Welcome, ${profile.fullName.split(' ')[0]}`}
+        subtitle={`Today is ${formatDate(todayISO())} â€” here is your health overview.`}
+        actions={
+          <Link to="/medications" className="btn btn-primary">
+            <Plus className="h-4 w-4" /> Add Medication
+          </Link>
+        }
+      />
+
+      {/* Stats */}
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatCard label="Today's Doses" value={todayDoses.length} icon={<Calendar className="h-5 w-5" />} accent="primary" />
+        <StatCard label="Adherence Rate" value={`${adherence.rate}%`} icon={<TrendingUp className="h-5 w-5" />} accent="accent" />
+        <StatCard label="Low Stock" value={lowStock.length} icon={<Package className="h-5 w-5" />} accent="warning" />
+        <StatCard label="Active Medicines" value={medications.length} icon={<Pill className="h-5 w-5" />} accent="secondary" />
+      </div>
+
+      <div className="mt-6 grid gap-6 lg:grid-cols-3">
+        {/* Today's schedule */}
+        <Card className="lg:col-span-2">
+          <div className="mb-4 flex items-center justify-between">
+            <SectionTitle>Today's Medication Schedule</SectionTitle>
+            <Link to="/reminders" className="text-sm font-medium text-primary-600 hover:underline dark:text-primary-400">View all</Link>
+          </div>
+          {todayDoses.length === 0 ? (
+            <EmptyState icon={<Bell className="h-8 w-8" />} title="No doses scheduled for today" message="Add a medication to see your schedule." />
+          ) : (
+            <div className="space-y-2">
+              {todayDoses.map((dose) => {
+                const cfg = statusConfig[dose.status];
+                const StatusIcon = cfg.icon;
+                return (
+                  <div key={dose.id} className="flex items-center justify-between rounded-xl border border-gray-100 px-4 py-3 dark:border-slate-800">
+                    <div className="flex items-center gap-3">
+                      <div className={`flex h-9 w-9 items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-800 ${cfg.color}`}>
+                        <StatusIcon className="h-4 w-4" />
+                      </div>
+                      <div>
+                        <p className="font-medium text-gray-900 dark:text-white">{dose.medicationName}</p>
+                        <p className="text-xs text-gray-500 dark:text-gray-400">{dose.dosage} Â· {formatTime(dose.scheduledTime)}</p>
+                      </div>
+                    </div>
+                    <Badge variant={dose.status === 'taken' ? 'success' : dose.status === 'missed' ? 'error' : dose.status === 'skipped' ? 'neutral' : 'info'}>
+                      {cfg.label}
+                    </Badge>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="mt-4 grid grid-cols-3 gap-2 text-center">
+            <div className="rounded-xl bg-success-50 p-3 dark:bg-success-700/10">
+              <p className="text-2xl font-bold text-success-600 dark:text-success-400">{completed.length}</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Completed</p>
+            </div>
+            <div className="rounded-xl bg-secondary-50 p-3 dark:bg-secondary-700/10">
+              <p className="text-2xl font-bold text-secondary-600 dark:text-secondary-400">{upcoming.length}</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Upcoming</p>
+            </div>
+            <div className="rounded-xl bg-error-50 p-3 dark:bg-error-700/10">
+              <p className="text-2xl font-bold text-error-600 dark:text-error-400">{missed.length}</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Missed</p>
+            </div>
+          </div>
+        </Card>
+
+        {/* Quick actions + emergency */}
+        <div className="space-y-6">
+          <Card>
+            <SectionTitle className="mb-3">Quick Actions</SectionTitle>
+            <div className="grid grid-cols-3 gap-2">
+              {quickActions.map((a) => {
+                const Icon = a.icon;
+                return (
+                  <Link key={a.label} to={a.path} className="flex flex-col items-center gap-1 rounded-xl border border-gray-100 p-3 text-center transition hover:bg-gray-50 dark:border-slate-800 dark:hover:bg-slate-800">
+                    <div className={`flex h-8 w-8 items-center justify-center rounded-lg ${a.color}`}>
+                      <Icon className="h-4 w-4" />
+                    </div>
+                    <span className="text-[10px] font-medium leading-tight text-gray-700 dark:text-gray-300">{a.label}</span>
+                  </Link>
+                );
+              })}
+            </div>
+          </Card>
+          <Card className="border-error-200 dark:border-error-700/50">
+            <div className="flex items-center gap-2">
+              <Siren className="h-5 w-5 text-error-500" />
+              <SectionTitle>Emergency</SectionTitle>
+            </div>
+            <p className="mt-2 text-sm text-gray-600 dark:text-gray-400">In a real emergency, call your local emergency number (e.g., 112 / 911 / 102).</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Link to="/emergency" className="btn btn-danger btn-sm">View Info</Link>
+              <Link to="/emergency-guide" className="btn btn-outline btn-sm">Download Guide</Link>
+            </div>
+          </Card>
+        </div>
+      </div>
+
+      {/* Inventory + adherence + reports */}
+      <div className="mt-6 grid gap-6 lg:grid-cols-3">
+        <Card>
+          <div className="mb-3 flex items-center justify-between">
+            <SectionTitle>Medicine Inventory</SectionTitle>
+            <Link to="/inventory" className="text-sm text-primary-600 hover:underline dark:text-primary-400">Manage</Link>
+          </div>
+          {medications.length === 0 ? (
+            <p className="text-sm text-gray-500 dark:text-gray-400">No medicines added yet.</p>
+          ) : (
+            <div className="space-y-2">
+              {medications.slice(0, 4).map((m) => (
+                <div key={m.id} className="flex items-center justify-between text-sm">
+                  <span className="text-gray-700 dark:text-gray-300">{m.name}</span>
+                  <Badge variant={m.quantity <= m.lowStockThreshold ? 'error' : 'success'}>
+                    {m.quantity} {m.unit}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <div className="mb-3 flex items-center justify-between">
+            <SectionTitle>Refill Alerts</SectionTitle>
+            <Link to="/refill-alerts" className="text-sm text-primary-600 hover:underline dark:text-primary-400">View all</Link>
+          </div>
+          {refillAlerts.length === 0 ? (
+            <div className="flex items-center gap-2 text-sm text-success-600 dark:text-success-400">
+              <CheckCircle2 className="h-4 w-4" /> All medicines well stocked.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {refillAlerts.slice(0, 3).map((a) => (
+                <div key={a.med.id} className="flex items-center gap-2 rounded-xl bg-warning-50 px-3 py-2 dark:bg-warning-700/10">
+                  <AlertTriangle className="h-4 w-4 text-warning-500" />
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-gray-900 dark:text-white">{a.med.name}</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">~{a.daysRemaining} days left</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <div className="mb-3 flex items-center justify-between">
+            <SectionTitle>Recent Reports</SectionTitle>
+            <Link to="/reports" className="text-sm text-primary-600 hover:underline dark:text-primary-400">All reports</Link>
+          </div>
+          {recentReports.length === 0 ? (
+            <p className="text-sm text-gray-500 dark:text-gray-400">No reports generated yet.</p>
+          ) : (
+            <div className="space-y-2">
+              {recentReports.map((r) => (
+                <Link key={r.id} to="/reports" className="flex items-center gap-2 rounded-xl border border-gray-100 px-3 py-2 hover:bg-gray-50 dark:border-slate-800 dark:hover:bg-slate-800">
+                  <FileText className="h-4 w-4 text-secondary-500" />
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-gray-900 dark:text-white">{r.type}</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">{formatDate(r.generatedDate)}</p>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
+          <div className="mt-4">
+            <Link to="/patient-file" className="flex items-center gap-2 rounded-xl bg-primary-50 px-3 py-2 text-sm font-medium text-primary-700 hover:bg-primary-100 dark:bg-primary-700/10 dark:text-primary-400">
+              <Activity className="h-4 w-4" /> View Patient File
+            </Link>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+
+================================================================================
+FILE: src\pages\PatientFile.tsx
+================================================================================
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import {
+  FolderHeart, Search, Download, Printer, Edit2, FileText, Pill,
+  AlertTriangle, Activity, Package, FlaskConical, Stethoscope, Phone,
+  ShieldCheck, HeartPulse, Clock, Camera,
+} from 'lucide-react';
+import { useData } from '@/context/DataContext';
+import { Card, PageHeader, Badge, SectionTitle, EmptyState } from '@/components/ui';
+import Modal from '@/components/ui/Modal';
+import { useToast } from '@/components/ui/Toast';
+import { generateMedicalPDF } from '@/lib/pdf';
+import {
+  formatDate, formatTime, getAdherenceStats, todayISO, ensureTodayDoses,
+} from '@/lib/medUtils';
+import type { PatientProfile } from '@/types';
+
+const fileSections = [
+  { id: 'cover', label: 'Cover Page', icon: ShieldCheck },
+  { id: 'demographics', label: 'Demographics', icon: FolderHeart },
+  { id: 'emergency', label: 'Emergency Contacts', icon: Phone },
+  { id: 'allergies', label: 'Allergies & Sensitivities', icon: AlertTriangle },
+  { id: 'history', label: 'Medical History', icon: Activity },
+  { id: 'medications', label: 'Medications & Schedules', icon: Pill },
+  { id: 'adherence', label: 'Adherence History', icon: Clock },
+  { id: 'monitoring', label: 'Camera Monitoring History', icon: Camera },
+  { id: 'inventory', label: 'Inventory & Refill History', icon: Package },
+  { id: 'reports', label: 'Medical Reports', icon: FileText },
+  { id: 'labs', label: 'Lab Reports (Sample)', icon: FlaskConical },
+  { id: 'visits', label: 'Visits & Consultations (Sample)', icon: Stethoscope },
+  { id: 'provider', label: 'Healthcare Provider', icon: Stethoscope },
+  { id: 'additional', label: 'Additional Information', icon: FileText },
+];
+
+export default function PatientFile() {
+  const { profile, setProfile, medications, doses, refills, labs, visits, reports } = useData();
+  const notify = useToast();
+  const [activeSection, setActiveSection] = useState('cover');
+  const [search, setSearch] = useState('');
+  const [editOpen, setEditOpen] = useState(false);
+  const [editForm, setEditForm] = useState<PatientProfile>(profile);
+
+  const allDoses = ensureTodayDoses(doses, medications);
+  const adherence = getAdherenceStats(allDoses);
+  const monitoringSessions = allDoses.filter((d) => d.source === 'camera' || d.source === 'simulated' || d.monitoringStatus !== 'scheduled').slice(-20).reverse();
+
+  function exportFullPDF() {
+    try {
+      const doc = generateMedicalPDF({
+        profile, medications, doses: allDoses, refills, labs, visits,
+        reportId: `PF-${new Date().getFullYear()}-${String(Date.now()).slice(-4)}`,
+        reportTitle: 'Complete Patient Medical File',
+        includeSections: fileSections.map((s) => s.id),
+      });
+      doc.save(`Patient-File-${profile.fullName.replace(/\s/g, '-')}.pdf`);
+      notify('Patient file PDF downloaded.', 'success');
+    } catch {
+      notify('PDF generation failed.', 'error');
+    }
+  }
+
+  function saveEdit() {
+    setProfile(editForm);
+    setEditOpen(false);
+    notify('Patient information updated.', 'success');
+  }
+
+  const renderSection = (id: string) => {
+    switch (id) {
+      case 'cover':
+        return (
+          <div>
+            <div className="rounded-2xl border-2 border-primary-200 p-6 dark:border-primary-700/50">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <HeartPulse className="h-6 w-6 text-primary-600" />
+                  <span className="text-lg font-bold text-gray-900 dark:text-white">MediCare AI</span>
+                </div>
+                <Badge variant="error">DEMO â€” NOT AN OFFICIAL MEDICAL RECORD</Badge>
+              </div>
+              <h2 className="mt-6 text-xl font-bold text-gray-900 dark:text-white">Patient Medical File</h2>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <InfoRow label="Patient Name" value={profile.fullName} />
+                <InfoRow label="Patient ID" value={profile.patientId} />
+                <InfoRow label="Date of Birth / Age" value={profile.dateOfBirth ? `${formatDate(profile.dateOfBirth)} (${profile.age})` : profile.age} />
+                <InfoRow label="Blood Group" value={profile.bloodGroup} />
+                <InfoRow label="Emergency Contact" value={profile.emergencyContacts[0] ? `${profile.emergencyContacts[0].name} â€” ${profile.emergencyContacts[0].phone}` : ''} />
+                <InfoRow label="Known Allergies" value={profile.allergies.join(', ')} />
+                <InfoRow label="Current Medications" value={medications.map((m) => m.name).join(', ') || 'Not provided'} />
+                <InfoRow label="Medical Alerts" value={profile.medicalAlerts.join('; ')} />
+              </div>
+              <p className="mt-6 text-xs text-gray-400">Generated: {formatDate(todayISO())}</p>
+            </div>
+          </div>
+        );
+      case 'demographics':
+        return (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <InfoRow label="Full Name" value={profile.fullName} />
+            <InfoRow label="Patient ID" value={profile.patientId} />
+            <InfoRow label="Date of Birth" value={profile.dateOfBirth ? formatDate(profile.dateOfBirth) : ''} />
+            <InfoRow label="Age" value={profile.age} />
+            <InfoRow label="Gender" value={profile.gender} />
+            <InfoRow label="Blood Group" value={profile.bloodGroup} />
+            <InfoRow label="Address" value={profile.address} />
+            <InfoRow label="Phone" value={profile.phone} />
+            <InfoRow label="Email" value={profile.email} />
+          </div>
+        );
+      case 'emergency':
+        return profile.emergencyContacts.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">Not provided</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-4">Name</th><th className="pb-2 pr-4">Relationship</th><th className="pb-2">Phone</th></tr></thead>
+            <tbody>{profile.emergencyContacts.map((c) => (<tr key={c.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-4 text-gray-900 dark:text-white">{c.name}</td><td className="py-2 pr-4 text-gray-600 dark:text-gray-400">{c.relationship}</td><td className="py-2 text-gray-600 dark:text-gray-400">{c.phone}</td></tr>))}</tbody>
+          </table>
+        );
+      case 'allergies':
+        return (
+          <div className="space-y-4">
+            <div><p className="label">Allergies</p>{profile.allergies.length === 0 ? <p className="text-sm text-gray-500 dark:text-gray-400">Not provided</p> : <div className="flex flex-wrap gap-2">{profile.allergies.map((a) => <Badge key={a} variant="error">{a}</Badge>)}</div>}</div>
+            <div><p className="label">Medical Alerts</p>{profile.medicalAlerts.length === 0 ? <p className="text-sm text-gray-500 dark:text-gray-400">Not provided</p> : <p className="text-sm text-gray-700 dark:text-gray-300">{profile.medicalAlerts.join('; ')}</p>}</div>
+          </div>
+        );
+      case 'history':
+        return (
+          <div><p className="label">Existing Conditions</p>{profile.conditions.length === 0 ? <p className="text-sm text-gray-500 dark:text-gray-400">Not provided</p> : <div className="flex flex-wrap gap-2">{profile.conditions.map((c) => <Badge key={c} variant="warning">{c}</Badge>)}</div>}</div>
+        );
+      case 'medications':
+        return medications.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">Not provided</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-3">Medicine</th><th className="pb-2 pr-3">Dose</th><th className="pb-2 pr-3">Schedule</th><th className="pb-2 pr-3">Instructions</th><th className="pb-2">Stock</th></tr></thead>
+            <tbody>{medications.map((m) => (<tr key={m.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-3 text-gray-900 dark:text-white">{m.name}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{m.dosage} {m.unit}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{m.times.map((t) => formatTime(t)).join(', ')}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{m.instructions || 'Not provided'}</td><td className="py-2 text-gray-600 dark:text-gray-400">{m.quantity} {m.unit}</td></tr>))}</tbody>
+          </table>
+        );
+      case 'adherence':
+        return (
+          <div>
+            <div className="mb-4 grid grid-cols-3 gap-3 text-center">
+              <div className="rounded-xl bg-success-50 p-3 dark:bg-success-700/10"><p className="text-2xl font-bold text-success-600 dark:text-success-400">{adherence.rate}%</p><p className="text-xs text-gray-500">Adherence</p></div>
+              <div className="rounded-xl bg-primary-50 p-3 dark:bg-primary-700/10"><p className="text-2xl font-bold text-primary-600 dark:text-primary-400">{adherence.taken}</p><p className="text-xs text-gray-500">Taken</p></div>
+              <div className="rounded-xl bg-error-50 p-3 dark:bg-error-700/10"><p className="text-2xl font-bold text-error-600 dark:text-error-400">{adherence.missed}</p><p className="text-xs text-gray-500">Missed</p></div>
+            </div>
+            <table className="w-full text-sm">
+              <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-3">Date</th><th className="pb-2 pr-3">Time</th><th className="pb-2 pr-3">Medicine</th><th className="pb-2">Status</th></tr></thead>
+              <tbody>{allDoses.slice(-15).reverse().map((d) => (<tr key={d.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{d.scheduledDate}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{formatTime(d.scheduledTime)}</td><td className="py-2 pr-3 text-gray-900 dark:text-white">{d.medicationName}</td><td className="py-2"><Badge variant={d.status === 'taken' ? 'success' : d.status === 'missed' ? 'error' : 'neutral'}>{d.status.replace('_', ' ')}</Badge></td></tr>))}</tbody>
+            </table>
+          </div>
+        );
+      case 'monitoring':
+        return monitoringSessions.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">No monitoring sessions recorded.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-3">Date</th><th className="pb-2 pr-3">Medicine</th><th className="pb-2 pr-3">Monitoring</th><th className="pb-2 pr-3">Confirmation</th><th className="pb-2">Source</th></tr></thead>
+            <tbody>{monitoringSessions.map((d) => (<tr key={d.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{d.scheduledDate}</td><td className="py-2 pr-3 text-gray-900 dark:text-white">{d.medicationName}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{d.monitoringStatus.replace('_', ' ')}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{d.status.replace('_', ' ')}</td><td className="py-2"><Badge variant="info">{d.source}</Badge></td></tr>))}</tbody>
+          </table>
+        );
+      case 'inventory':
+        return (
+          <div className="space-y-4">
+            <table className="w-full text-sm">
+              <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-3">Medicine</th><th className="pb-2 pr-3">Stock</th><th className="pb-2 pr-3">Low Threshold</th><th className="pb-2">Expiry</th></tr></thead>
+              <tbody>{medications.map((m) => (<tr key={m.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-3 text-gray-900 dark:text-white">{m.name}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{m.quantity} {m.unit}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{m.lowStockThreshold}</td><td className="py-2 text-gray-600 dark:text-gray-400">{m.expiryDate ? formatDate(m.expiryDate) : 'Not provided'}</td></tr>))}</tbody>
+            </table>
+            {refills.length > 0 && (
+              <div>
+                <p className="label">Refill History</p>
+                <table className="w-full text-sm">
+                  <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-3">Date</th><th className="pb-2 pr-3">Medicine</th><th className="pb-2 pr-3">Qty</th><th className="pb-2">Type</th></tr></thead>
+                  <tbody>{refills.map((r) => (<tr key={r.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{formatDate(r.date)}</td><td className="py-2 pr-3 text-gray-900 dark:text-white">{r.medicationName}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{r.quantity}</td><td className="py-2 text-gray-600 dark:text-gray-400">{r.type}</td></tr>))}</tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        );
+      case 'reports':
+        return reports.length === 0 ? (
+          <p className="text-sm text-gray-500 dark:text-gray-400">No reports generated yet.</p>
+        ) : (
+          <div className="space-y-2">{reports.map((r) => (<Link key={r.id} to="/reports" className="flex items-center gap-3 rounded-xl border border-gray-100 p-3 hover:bg-gray-50 dark:border-slate-800 dark:hover:bg-slate-800"><FileText className="h-5 w-5 text-secondary-500" /><div><p className="text-sm font-medium text-gray-900 dark:text-white">{r.type}</p><p className="text-xs text-gray-500 dark:text-gray-400">{formatDate(r.generatedDate)} Â· {r.reportId}</p></div></Link>))}</div>
+        );
+      case 'labs':
+        return (
+          <div>
+            <Badge variant="info">Sample Data</Badge>
+            <table className="mt-3 w-full text-sm">
+              <thead><tr className="border-b border-gray-200 text-left text-xs text-gray-500 dark:border-slate-700"><th className="pb-2 pr-3">Date</th><th className="pb-2 pr-3">Test</th><th className="pb-2 pr-3">Result</th><th className="pb-2 pr-3">Normal Range</th><th className="pb-2">Status</th></tr></thead>
+              <tbody>{labs.map((l) => (<tr key={l.id} className="border-b border-gray-100 dark:border-slate-800"><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{formatDate(l.date)}</td><td className="py-2 pr-3 text-gray-900 dark:text-white">{l.testName}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{l.result}</td><td className="py-2 pr-3 text-gray-600 dark:text-gray-400">{l.normalRange}</td><td className="py-2"><Badge variant={l.status === 'normal' ? 'success' : l.status === 'abnormal' ? 'error' : 'warning'}>{l.status}</Badge></td></tr>))}</tbody>
+            </table>
+          </div>
+        );
+      case 'visits':
+        return (
+          <div>
+            <Badge variant="info">Sample Data</Badge>
+            <div className="mt-3 space-y-3">{visits.map((v) => (<div key={v.id} className="rounded-xl border border-gray-100 p-3 dark:border-slate-800"><p className="text-sm font-medium text-gray-900 dark:text-white">{v.reason}</p><p className="text-xs text-gray-500 dark:text-gray-400">{formatDate(v.date)} Â· {v.doctor}</p><p className="mt-1 text-sm text-gray-600 dark:text-gray-400">{v.notes}</p></div>))}</div>
+          </div>
+        );
+      case 'provider':
+        return (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <InfoRow label="Provider Name" value={profile.providerName} />
+            <InfoRow label="Specialty" value={profile.providerSpecialty} />
+            <InfoRow label="Phone" value={profile.providerPhone} />
+            <InfoRow label="Hospital" value={profile.hospitalName} />
+            <InfoRow label="Hospital Address" value={profile.hospitalAddress} />
+            <InfoRow label="Caregiver" value={profile.caregiverName ? `${profile.caregiverName} (${profile.caregiverPhone})` : ''} />
+          </div>
+        );
+      case 'additional':
+        return <InfoRow label="Additional Notes" value={profile.additionalInfo} />;
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div>
+      <PageHeader
+        title="My Patient File"
+        subtitle="A structured digital patient folder. Demo data is clearly labelled."
+        actions={
+          <>
+            <button onClick={() => { setEditForm(profile); setEditOpen(true); }} className="btn btn-outline">
+              <Edit2 className="h-4 w-4" /> Edit
+            </button>
+            <button onClick={exportFullPDF} className="btn btn-primary">
+              <Download className="h-4 w-4" /> Export PDF
+            </button>
+            <button onClick={() => window.print()} className="btn btn-outline no-print">
+              <Printer className="h-4 w-4" /> Print
+            </button>
+          </>
+        }
+      />
+
+      <div className="grid gap-6 lg:grid-cols-4">
+        {/* Section nav */}
+        <Card className="lg:col-span-1">
+          <div className="relative mb-3">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+            <input className="input pl-10 text-sm" placeholder="Search sections..." value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <nav className="space-y-1">
+            {fileSections
+              .filter((s) => s.label.toLowerCase().includes(search.toLowerCase()))
+              .map((s) => {
+                const Icon = s.icon;
+                const active = activeSection === s.id;
+                return (
+                  <button key={s.id} onClick={() => setActiveSection(s.id)} className={`flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium transition ${active ? 'bg-primary-50 text-primary-700 dark:bg-primary-700/20 dark:text-primary-400' : 'text-gray-600 hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-slate-800'}`}>
+                    <Icon className="h-4 w-4 shrink-0" />
+                    {s.label}
+                  </button>
+                );
+              })}
+          </nav>
+        </Card>
+
+        {/* Section content */}
+        <div className="lg:col-span-3">
+          <Card>
+            <div className="mb-4 flex items-center gap-2">
+              {(() => {
+                const Icon = fileSections.find((s) => s.id === activeSection)?.icon || FileText;
+                return <Icon className="h-5 w-5 text-primary-500" />;
+              })()}
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{fileSections.find((s) => s.id === activeSection)?.label}</h2>
+            </div>
+            {renderSection(activeSection)}
+          </Card>
+
+          {/* Printable full file */}
+          <div className="print-area hidden">
+            <h1>Patient Medical File â€” {profile.fullName}</h1>
+            <p>Generated: {formatDate(todayISO())}</p>
+            <p>DEMO â€” NOT AN OFFICIAL MEDICAL RECORD</p>
+            {fileSections.map((s) => (
+              <div key={s.id}>
+                <h2>{s.label}</h2>
+                <div>{renderSection(s.id)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Edit modal */}
+      <Modal open={editOpen} onClose={() => setEditOpen(false)} title="Edit Patient Information" size="lg"
+        footer={<><button onClick={() => setEditOpen(false)} className="btn btn-outline">Cancel</button><button onClick={saveEdit} className="btn btn-primary">Save</button></>}
+      >
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div><label className="label">Full Name</label><input className="input" value={editForm.fullName} onChange={(e) => setEditForm({ ...editForm, fullName: e.target.value })} /></div>
+          <div><label className="label">Patient ID</label><input className="input" value={editForm.patientId} onChange={(e) => setEditForm({ ...editForm, patientId: e.target.value })} /></div>
+          <div><label className="label">Date of Birth</label><input type="date" className="input" value={editForm.dateOfBirth} onChange={(e) => setEditForm({ ...editForm, dateOfBirth: e.target.value })} /></div>
+          <div><label className="label">Age</label><input className="input" value={editForm.age} onChange={(e) => setEditForm({ ...editForm, age: e.target.value })} /></div>
+          <div><label className="label">Blood Group</label><input className="input" value={editForm.bloodGroup} onChange={(e) => setEditForm({ ...editForm, bloodGroup: e.target.value })} /></div>
+          <div><label className="label">Gender</label><input className="input" value={editForm.gender} onChange={(e) => setEditForm({ ...editForm, gender: e.target.value })} /></div>
+          <div><label className="label">Phone</label><input className="input" value={editForm.phone} onChange={(e) => setEditForm({ ...editForm, phone: e.target.value })} /></div>
+          <div><label className="label">Email</label><input className="input" value={editForm.email} onChange={(e) => setEditForm({ ...editForm, email: e.target.value })} /></div>
+          <div className="sm:col-span-2"><label className="label">Address</label><input className="input" value={editForm.address} onChange={(e) => setEditForm({ ...editForm, address: e.target.value })} /></div>
+          <div className="sm:col-span-2"><label className="label">Allergies (comma-separated)</label><input className="input" value={editForm.allergies.join(', ')} onChange={(e) => setEditForm({ ...editForm, allergies: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) })} /></div>
+          <div className="sm:col-span-2"><label className="label">Conditions (comma-separated)</label><input className="input" value={editForm.conditions.join(', ')} onChange={(e) => setEditForm({ ...editForm, conditions: e.target.value.split(',').map((s) => s.trim()).filter(Boolean) })} /></div>
+          <div className="sm:col-span-2"><label className="label">Medical Alerts (semicolon-separated)</label><input className="input" value={editForm.medicalAlerts.join('; ')} onChange={(e) => setEditForm({ ...editForm, medicalAlerts: e.target.value.split(';').map((s) => s.trim()).filter(Boolean) })} /></div>
+          <div><label className="label">Provider Name</label><input className="input" value={editForm.providerName} onChange={(e) => setEditForm({ ...editForm, providerName: e.target.value })} /></div>
+          <div><label className="label">Provider Phone</label><input className="input" value={editForm.providerPhone} onChange={(e) => setEditForm({ ...editForm, providerPhone: e.target.value })} /></div>
+          <div className="sm:col-span-2"><label className="label">Additional Info</label><textarea className="input" rows={3} value={editForm.additionalInfo} onChange={(e) => setEditForm({ ...editForm, additionalInfo: e.target.value })} /></div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-xs text-gray-500 dark:text-gray-400">{label}</p>
+      <p className="text-sm font-medium text-gray-900 dark:text-white">{value || 'Not provided'}</p>
+    </div>
+  );
+}
+
+
+================================================================================
+FILE: package.json
+================================================================================
+{
+  "name": "vite-react-typescript-starter",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
+    "jspdf": "^4.2.1",
+    "lucide-react": "^0.446.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.18.5",
+    "recharts": "^3.10.1",
+    "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.1",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^5.1.1",
+    "autoprefixer": "^10.4.18",
+    "eslint": "^9.9.1",
+    "eslint-plugin-react-hooks": "^5.1.0-rc.0",
+    "eslint-plugin-react-refresh": "^0.4.11",
+    "globals": "^15.9.0",
+    "postcss": "^8.4.35",
+    "tailwindcss": "^3.4.1",
+    "typescript": "^5.5.3",
+    "typescript-eslint": "^8.3.0",
+    "vite": "^7.3.7"
+  }
+}
+
